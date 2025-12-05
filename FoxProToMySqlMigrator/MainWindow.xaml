@@ -1,0 +1,197 @@
+﻿<Window x:Class="FoxProToMySqlMigrator.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FoxPro to MySQL Migrator" Height="650" Width="1100">
+    
+    <Window.Resources>
+        <!-- Spinner Animation -->
+        <Storyboard x:Key="SpinnerAnimation" RepeatBehavior="Forever">
+            <DoubleAnimation Storyboard.TargetName="SpinnerRotation"
+                           Storyboard.TargetProperty="Angle"
+                           From="0" To="360" Duration="0:0:1"/>
+        </Storyboard>
+    </Window.Resources>
+    
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- FoxPro folder -->
+        <TextBlock Grid.Row="0" Grid.Column="0" Margin="0,0,5,5"
+                   VerticalAlignment="Center" Text="FoxPro folder:"/>
+        <TextBox x:Name="TxtFoxProFolder"
+                 Grid.Row="0" Grid.Column="1" Margin="0,0,5,5"/>
+        <Button Grid.Row="0" Grid.Column="2" Margin="0,0,0,5"
+                Padding="10,2"
+                Content="Browse..."
+                Click="BrowseFolder_Click"/>
+
+        <!-- MySQL connection string -->
+        <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,0,5,5"
+                   VerticalAlignment="Center" Text="MySQL Server:"/>
+        <TextBox x:Name="TxtMySqlServer"
+                 Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                 Margin="0,0,0,5"
+                 ToolTip="Example: Server=localhost;User Id=root;Password=yourpass;"/>
+
+        <!-- Database name and Migration Mode -->
+        <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,0,5,5"
+                   VerticalAlignment="Center" Text="Target database:"/>
+        <TextBox x:Name="TxtDatabaseName"
+                 Grid.Row="2" Grid.Column="1" Margin="0,0,5,5"/>
+        <ComboBox x:Name="CmbMigrationMode"
+                  Grid.Row="2" Grid.Column="2"
+                  Margin="0,0,0,5"
+                  Width="150"
+                  SelectedIndex="0">
+            <ComboBoxItem Content="Full Reload"/>
+            <ComboBoxItem Content="Patch Load"/>
+        </ComboBox>
+
+        <!-- Batch Size -->
+        <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,0,5,5"
+                   VerticalAlignment="Center" Text="Batch size:"/>
+        <StackPanel Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2"
+                   Orientation="Horizontal" Margin="0,0,0,5">
+            <TextBox x:Name="TxtBatchSize"
+                     Width="100"
+                     Text="1000"
+                     ToolTip="Number of records to commit per batch (recommended: 500-2000)"/>
+            <TextBlock Text=" records per commit" 
+                      VerticalAlignment="Center"
+                      Margin="5,0,0,0"
+                      Foreground="Gray"/>
+        </StackPanel>
+
+        <!-- Options -->
+        <TextBlock Grid.Row="4" Grid.Column="0" Margin="0,0,5,5"
+                   VerticalAlignment="Center" Text="Options:"/>
+        <StackPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" 
+                    Orientation="Horizontal" Margin="0,0,0,5">
+            <CheckBox x:Name="ChkSafeMode"
+                      Margin="0,0,15,0"
+                      IsChecked="True"
+                      Content="Safe mode (smart VARCHAR/TEXT)"/>
+            <CheckBox x:Name="ChkSkipDeleted"
+                      IsChecked="True"
+                      Content="Don't include deleted records"/>
+        </StackPanel>
+
+        <!-- Separator Line -->
+        <Border Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="3"
+                BorderBrush="LightGray"
+                BorderThickness="0,1,0,0"
+                Margin="0,5,0,10"/>
+
+        <!-- Buttons + Logs -->
+        <Grid Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="3">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*"/>
+                <ColumnDefinition Width="5"/>
+                <ColumnDefinition Width="1*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Buttons + Spinner -->
+            <StackPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3" 
+                       Orientation="Horizontal" Margin="0,0,0,5">
+                <Button x:Name="BtnMigrate"
+                        Content="Migrate"
+                        Width="100" Margin="0,0,5,0"
+                        Click="BtnMigrate_Click"/>
+                <Button x:Name="BtnStop"
+                        Content="Stop"
+                        Width="100" Margin="0,0,5,0"
+                        Background="#DC3545"
+                        Foreground="White"
+                        Click="BtnStop_Click"
+                        Visibility="Collapsed"/>
+                <Button x:Name="BtnClearLog"
+                        Content="Clear Logs"
+                        Width="100" Margin="0,0,10,0"
+                        Click="BtnClearLog_Click"/>
+                
+                <!-- Loading Spinner -->
+                <StackPanel x:Name="LoadingSpinner"
+                           Orientation="Horizontal"
+                           Visibility="Collapsed"
+                           VerticalAlignment="Center">
+                    <Viewbox Width="20" Height="20" Margin="0,0,8,0">
+                        <Canvas Width="24" Height="24">
+                            <Path Fill="#2196F3"
+                                  Data="M12,4 A8,8 0 0,1 20,12">
+                                <Path.RenderTransform>
+                                    <RotateTransform x:Name="SpinnerRotation" CenterX="12" CenterY="12"/>
+                                </Path.RenderTransform>
+                            </Path>
+                        </Canvas>
+                    </Viewbox>
+                    <TextBlock x:Name="LoadingText"
+                              Text="Migrating..."
+                              Foreground="#2196F3"
+                              FontWeight="Bold"
+                              VerticalAlignment="Center"/>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- Left Panel: Detailed Log -->
+            <Grid Grid.Row="1" Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                
+                <TextBlock Grid.Row="0"
+                          Text="Migration Log (Detailed)" 
+                          FontWeight="Bold" 
+                          Margin="0,0,0,5"/>
+                <ListBox Grid.Row="1"
+                         x:Name="LstLog" 
+                         ScrollViewer.VerticalScrollBarVisibility="Auto" 
+                         ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
+            </Grid>
+
+            <!-- Splitter -->
+            <GridSplitter Grid.Row="1" Grid.Column="1" 
+                         Width="5" 
+                         HorizontalAlignment="Stretch" 
+                         VerticalAlignment="Stretch"
+                         Background="LightGray"/>
+
+            <!-- Right Panel: Table Summary -->
+            <Grid Grid.Row="1" Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                
+                <TextBlock Grid.Row="0"
+                          Text="Table Summary" 
+                          FontWeight="Bold" 
+                          Margin="0,0,0,5"/>
+                <ListBox Grid.Row="1"
+                         x:Name="LstTableSummary" 
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         FontFamily="Consolas"
+                         FontSize="12"/>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
