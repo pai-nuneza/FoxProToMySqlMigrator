@@ -1,6 +1,7 @@
 ﻿using System.Data;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using DbfDataReader;
 using MySql.Data.MySqlClient;
 
@@ -21,11 +22,56 @@ namespace FoxProToMySqlMigrator
         public int SkippedCount { get; set; }
     }
 
+    public class MigrationCheckpoint
+    {
+        public string FoxProFolder { get; set; } = "";
+        public string TargetDatabase { get; set; } = "";
+        public DateTime StartTime { get; set; }
+        public DateTime LastUpdateTime { get; set; }
+        public List<string> CompletedTables { get; set; } = new();
+        public int TotalTables { get; set; }
+        public bool IsCompleted { get; set; }
+    }
+
     public class FoxProMigrationService
     {
         public event Action<string>? LogMessage;
         public event Action<TableMigrationResult>? TableCompleted;
         private string _errorLogPath = "";
+        private string _errorRecordsFolder = "";
+        private string _skippedRecordsFolder = "";
+        private string _migrationTimestamp = "";
+        private string _checkpointFilePath = "";
+
+        public async Task<MigrationCheckpoint?> LoadCheckpointAsync(string foxProFolder, string targetDatabase)
+        {
+            try
+            {
+                var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+                var checkpointFile = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs", $"checkpoint_{targetDatabase}.json");
+
+                if (File.Exists(checkpointFile))
+                {
+                    var json = await File.ReadAllTextAsync(checkpointFile);
+                    var checkpoint = JsonSerializer.Deserialize<MigrationCheckpoint>(json);
+                    
+                    // Validate checkpoint matches current migration
+                    if (checkpoint != null && 
+                        checkpoint.FoxProFolder == foxProFolder && 
+                        checkpoint.TargetDatabase == targetDatabase &&
+                        !checkpoint.IsCompleted)
+                    {
+                        return checkpoint;
+                    }
+                }
+            }
+            catch
+            {
+                // If checkpoint can't be loaded, return null
+            }
+
+            return null;
+        }
 
         public async Task MigrateAsync(
             string foxProFolder, 
@@ -35,6 +81,7 @@ namespace FoxProToMySqlMigrator
             bool skipDeletedRecords,
             MigrationMode migrationMode,
             int batchSize,
+            MigrationCheckpoint? resumeFromCheckpoint = null,
             CancellationToken cancellationToken = default)
         {
             try
@@ -44,8 +91,41 @@ namespace FoxProToMySqlMigrator
                 Log($"Batch Size: {batchSize} records per commit");
                 Log($"Skip Deleted Records: {skipDeletedRecords}");
                 
-                // Create error log file
-                _errorLogPath = Path.Combine(foxProFolder, $"migration_errors_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                // Create timestamp for this migration session
+                _migrationTimestamp = resumeFromCheckpoint?.StartTime.ToString("yyyyMMdd_HHmmss") 
+                    ?? DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                
+                // Create main logs folder on Desktop
+                var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+                var mainLogsFolder = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs", _migrationTimestamp);
+                Directory.CreateDirectory(mainLogsFolder);
+                
+                // Setup checkpoint file
+                var checkpointFolder = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs");
+                Directory.CreateDirectory(checkpointFolder);
+                _checkpointFilePath = Path.Combine(checkpointFolder, $"checkpoint_{targetDatabase}.json");
+                
+                // Create main error log file
+                _errorLogPath = Path.Combine(mainLogsFolder, "migration_errors.txt");
+                
+                // Create error records folder
+                _errorRecordsFolder = Path.Combine(mainLogsFolder, "ErrorRecords");
+                Directory.CreateDirectory(_errorRecordsFolder);
+                
+                // Create skipped records folder
+                _skippedRecordsFolder = Path.Combine(mainLogsFolder, "SkippedRecords");
+                Directory.CreateDirectory(_skippedRecordsFolder);
+                
+                if (resumeFromCheckpoint != null)
+                {
+                    Log($"📦 RESUMING migration from checkpoint");
+                    Log($"   Already completed: {resumeFromCheckpoint.CompletedTables.Count}/{resumeFromCheckpoint.TotalTables} tables");
+                    Log($"   Started: {resumeFromCheckpoint.StartTime:yyyy-MM-dd HH:mm:ss}");
+                }
+                
+                Log($"Error records will be saved to: {_errorRecordsFolder}");
+                Log($"Skipped records will be saved to: {_skippedRecordsFolder}");
+                Log($"All migration logs saved to: {mainLogsFolder}");
                 
                 if (!Directory.Exists(foxProFolder))
                 {
@@ -61,6 +141,21 @@ namespace FoxProToMySqlMigrator
                     Log("No DBF files found in the selected folder");
                     return;
                 }
+
+                // Initialize or restore checkpoint
+                var checkpoint = resumeFromCheckpoint ?? new MigrationCheckpoint
+                {
+                    FoxProFolder = foxProFolder,
+                    TargetDatabase = targetDatabase,
+                    StartTime = DateTime.Now,
+                    LastUpdateTime = DateTime.Now,
+                    TotalTables = dbfFiles.Length,
+                    CompletedTables = new List<string>(),
+                    IsCompleted = false
+                };
+
+                // Save initial checkpoint
+                await SaveCheckpointAsync(checkpoint);
 
                 // Check for cancellation
                 cancellationToken.ThrowIfCancellationRequested();
@@ -79,20 +174,49 @@ namespace FoxProToMySqlMigrator
 
                 foreach (var dbfFile in dbfFiles)
                 {
+                    var tableName = Path.GetFileNameWithoutExtension(dbfFile);
+                    
+                    // Skip already completed tables
+                    if (checkpoint.CompletedTables.Contains(tableName))
+                    {
+                        currentTable++;
+                        Log($"[{currentTable}/{totalTables}] ⏭️  Skipping already completed table: {tableName}");
+                        continue;
+                    }
+
                     // Check for cancellation before each table
                     cancellationToken.ThrowIfCancellationRequested();
 
                     currentTable++;
-                    Log($"[{currentTable}/{totalTables}] Processing table: {Path.GetFileNameWithoutExtension(dbfFile)}");
+                    Log($"[{currentTable}/{totalTables}] Processing table: {tableName}");
                     await MigrateTableAsync(dbfFile, mySqlConn, safeMode, skipDeletedRecords, migrationMode, batchSize, cancellationToken);
+                    
+                    // Update checkpoint after successful table migration
+                    checkpoint.CompletedTables.Add(tableName);
+                    checkpoint.LastUpdateTime = DateTime.Now;
+                    await SaveCheckpointAsync(checkpoint);
+                }
+
+                // Mark as completed
+                checkpoint.IsCompleted = true;
+                await SaveCheckpointAsync(checkpoint);
+
+                // Clean up checkpoint file after successful completion
+                if (File.Exists(_checkpointFilePath))
+                {
+                    File.Delete(_checkpointFilePath);
                 }
 
                 Log("Migration completed successfully!");
-                Log($"Error log saved to: {_errorLogPath}");
+                Log($"===========================================");
+                Log($"📁 All logs saved to Desktop:");
+                Log($"   {mainLogsFolder}");
+                Log($"===========================================");
             }
             catch (OperationCanceledException)
             {
                 Log("Migration cancelled by user.");
+                Log($"💾 Progress saved! You can resume this migration later.");
                 throw;
             }
             catch (Exception ex)
@@ -100,6 +224,23 @@ namespace FoxProToMySqlMigrator
                 Log($"ERROR: {ex.Message}");
                 Log($"Stack trace: {ex.StackTrace}");
                 LogError("CRITICAL", "Migration", ex.Message, ex.StackTrace ?? "");
+                Log($"💾 Progress saved! You can resume this migration later.");
+            }
+        }
+
+        private async Task SaveCheckpointAsync(MigrationCheckpoint checkpoint)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(checkpoint, new JsonSerializerOptions 
+                { 
+                    WriteIndented = true 
+                });
+                await File.WriteAllTextAsync(_checkpointFilePath, json);
+            }
+            catch
+            {
+                // If checkpoint can't be saved, continue migration
             }
         }
 
@@ -388,6 +529,14 @@ namespace FoxProToMySqlMigrator
                 insertSql = $"INSERT INTO `{tableName}` ({columnNames}) VALUES ({paramNames})";
             }
 
+            // Create CSV file for skipped records
+            string? skippedRecordsCsvPath = null;
+            StreamWriter? skippedRecordsCsv = null;
+            
+            // Create CSV file for error records
+            string? errorRecordsCsvPath = null;
+            StreamWriter? errorRecordsCsv = null;
+
             MySqlTransaction? transaction = null;
             
             try
@@ -440,6 +589,35 @@ namespace FoxProToMySqlMigrator
                         if (skipDeletedRecords && isDeleted)
                         {
                             skippedCount++;
+                            
+                            // Log skipped record to CSV
+                            if (skippedRecordsCsv == null)
+                            {
+                                skippedRecordsCsvPath = Path.Combine(_skippedRecordsFolder, $"{tableName}_skipped.csv");
+                                skippedRecordsCsv = new StreamWriter(skippedRecordsCsvPath, false, Encoding.UTF8);
+                                
+                                // Write header
+                                var header = "RecordNumber," + string.Join(",", schema.Select(c => EscapeCsvValue(c.OriginalName))) + ",Reason";
+                                skippedRecordsCsv.WriteLine(header);
+                            }
+                            
+                            // Write record data
+                            var recordData = new List<string> { recordNumber.ToString() };
+                            for (int i = 0; i < schema.Count; i++)
+                            {
+                                try
+                                {
+                                    var value = dbfReader.GetValue(i);
+                                    recordData.Add(EscapeCsvValue(value?.ToString() ?? "NULL"));
+                                }
+                                catch
+                                {
+                                    recordData.Add("ERROR_READING_VALUE");
+                                }
+                            }
+                            recordData.Add("Record marked as deleted in DBF file");
+                            skippedRecordsCsv.WriteLine(string.Join(",", recordData));
+                            
                             continue;
                         }
 
@@ -505,7 +683,7 @@ namespace FoxProToMySqlMigrator
                     {
                         errorCount++;
                         
-                        // Build error details
+                        // Build error details for main error log
                         var errorDetails = new StringBuilder();
                         errorDetails.AppendLine($"Record #{recordNumber}:");
                         for (int i = 0; i < schema.Count; i++)
@@ -523,7 +701,36 @@ namespace FoxProToMySqlMigrator
                         errorDetails.AppendLine($"Error: {ex.Message}");
                         
                         LogError(tableName, $"Record #{recordNumber}", ex.Message, errorDetails.ToString());
-                        Log($"  ⚠️ Error in record #{recordNumber}: {ex.Message} (logged to error file)");
+                        
+                        // Log error record to CSV
+                        if (errorRecordsCsv == null)
+                        {
+                            errorRecordsCsvPath = Path.Combine(_errorRecordsFolder, $"{tableName}_errors.csv");
+                            errorRecordsCsv = new StreamWriter(errorRecordsCsvPath, false, Encoding.UTF8);
+                            
+                            // Write header
+                            var header = "RecordNumber," + string.Join(",", schema.Select(c => EscapeCsvValue(c.OriginalName))) + ",ErrorMessage";
+                            errorRecordsCsv.WriteLine(header);
+                        }
+                        
+                        // Write record data
+                        var recordData = new List<string> { recordNumber.ToString() };
+                        for (int i = 0; i < schema.Count; i++)
+                        {
+                            try
+                            {
+                                var value = dbfReader.GetValue(i);
+                                recordData.Add(EscapeCsvValue(value?.ToString() ?? "NULL"));
+                            }
+                            catch
+                            {
+                                recordData.Add("ERROR_READING_VALUE");
+                            }
+                        }
+                        recordData.Add(EscapeCsvValue(ex.Message));
+                        errorRecordsCsv.WriteLine(string.Join(",", recordData));
+                        
+                        Log($"  ⚠️ Error in record #{recordNumber}: {ex.Message} (logged to error files)");
                     }
                 }
                 
@@ -557,8 +764,39 @@ namespace FoxProToMySqlMigrator
                 LogError(tableName, "Transaction", ex.Message, ex.StackTrace ?? "");
                 throw;
             }
+            finally
+            {
+                // Close CSV files
+                if (skippedRecordsCsv != null)
+                {
+                    skippedRecordsCsv.Close();
+                    skippedRecordsCsv.Dispose();
+                    Log($"  📄 Skipped records saved to: {skippedRecordsCsvPath}");
+                }
+                
+                if (errorRecordsCsv != null)
+                {
+                    errorRecordsCsv.Close();
+                    errorRecordsCsv.Dispose();
+                    Log($"  📄 Error records saved to: {errorRecordsCsvPath}");
+                }
+            }
 
             return (rowCount, errorCount, deletedCount, skippedCount);
+        }
+
+        private string EscapeCsvValue(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return "";
+            
+            // Escape quotes and wrap in quotes if contains comma, quote, or newline
+            if (value.Contains(",") || value.Contains("\"") || value.Contains("\n") || value.Contains("\r"))
+            {
+                return "\"" + value.Replace("\"", "\"\"") + "\"";
+            }
+            
+            return value;
         }
 
         private void Log(string message)

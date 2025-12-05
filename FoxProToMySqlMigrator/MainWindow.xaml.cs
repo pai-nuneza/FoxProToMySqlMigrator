@@ -15,6 +15,7 @@ namespace FoxProToMySqlMigrator
         private readonly FoxProMigrationService _migrationService;
         private bool _isMigrating;
         private CancellationTokenSource? _cancellationTokenSource;
+        private MigrationCheckpoint? _currentCheckpoint;
 
         public MainWindow()
         {
@@ -33,6 +34,43 @@ namespace FoxProToMySqlMigrator
             TxtBatchSize.Text = "1000";
             ChkSafeMode.IsChecked = AppSettings.DefaultSafeMode;
             ChkSkipDeleted.IsChecked = AppSettings.DefaultSkipDeletedRecords;
+        }
+
+        private async void CheckForExistingCheckpoint()
+        {
+            if (string.IsNullOrWhiteSpace(TxtFoxProFolder.Text) || 
+                string.IsNullOrWhiteSpace(TxtDatabaseName.Text))
+            {
+                CheckpointNotification.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            var checkpoint = await _migrationService.LoadCheckpointAsync(
+                TxtFoxProFolder.Text, 
+                TxtDatabaseName.Text);
+
+            if (checkpoint != null)
+            {
+                _currentCheckpoint = checkpoint;
+                TxtCheckpointMessage.Text = $"Found incomplete migration: {checkpoint.CompletedTables.Count} of {checkpoint.TotalTables} tables completed. " +
+                                           $"Started: {checkpoint.StartTime:yyyy-MM-dd HH:mm:ss}";
+                CheckpointNotification.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                _currentCheckpoint = null;
+                CheckpointNotification.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private void TxtFoxProFolder_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        {
+            CheckForExistingCheckpoint();
+        }
+
+        private void TxtDatabaseName_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        {
+            CheckForExistingCheckpoint();
         }
 
         private void StartSpinner()
@@ -61,6 +99,26 @@ namespace FoxProToMySqlMigrator
             if (dialog.ShowDialog() == true)
             {
                 TxtFoxProFolder.Text = dialog.FolderName;
+            }
+        }
+
+        private async void BtnResumeCheckpoint_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentCheckpoint == null)
+                return;
+
+            var result = MessageBox.Show(
+                $"Resume migration from checkpoint?\n\n" +
+                $"Already completed: {_currentCheckpoint.CompletedTables.Count}/{_currentCheckpoint.TotalTables} tables\n" +
+                $"Started: {_currentCheckpoint.StartTime:yyyy-MM-dd HH:mm:ss}\n\n" +
+                $"This will continue from where the migration was stopped.",
+                "Resume Migration",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (result == MessageBoxResult.Yes)
+            {
+                await StartMigrationAsync(_currentCheckpoint);
             }
         }
 
@@ -97,6 +155,40 @@ namespace FoxProToMySqlMigrator
                 return;
             }
 
+            // Check if there's an existing checkpoint and ask user
+            if (_currentCheckpoint != null)
+            {
+                var result = MessageBox.Show(
+                    $"Found an incomplete migration:\n\n" +
+                    $"Already completed: {_currentCheckpoint.CompletedTables.Count}/{_currentCheckpoint.TotalTables} tables\n" +
+                    $"Started: {_currentCheckpoint.StartTime:yyyy-MM-dd HH:mm:ss}\n\n" +
+                    $"Do you want to:\n" +
+                    $"• YES - Resume from checkpoint\n" +
+                    $"• NO - Start fresh (checkpoint will be overwritten)",
+                    "Resume or Start Fresh?",
+                    MessageBoxButton.YesNoCancel,
+                    MessageBoxImage.Question);
+
+                if (result == MessageBoxResult.Cancel)
+                    return;
+
+                if (result == MessageBoxResult.Yes)
+                {
+                    await StartMigrationAsync(_currentCheckpoint);
+                    return;
+                }
+                else
+                {
+                    // User chose to start fresh
+                    _currentCheckpoint = null;
+                }
+            }
+
+            await StartMigrationAsync(null);
+        }
+
+        private async Task StartMigrationAsync(MigrationCheckpoint? resumeFromCheckpoint)
+        {
             try
             {
                 _isMigrating = true;
@@ -105,6 +197,7 @@ namespace FoxProToMySqlMigrator
                 // Update UI
                 BtnMigrate.IsEnabled = false;
                 BtnStop.Visibility = Visibility.Visible;
+                CheckpointNotification.Visibility = Visibility.Collapsed;
                 StartSpinner();
 
                 var migrationMode = CmbMigrationMode.SelectedIndex == 0 
@@ -114,6 +207,9 @@ namespace FoxProToMySqlMigrator
                 // Build connection string with database
                 var connectionString = TxtMySqlServer.Text.TrimEnd(';') + $";Database={TxtDatabaseName.Text};";
 
+                // Parse batch size
+                int.TryParse(TxtBatchSize.Text, out int batchSize);
+
                 await _migrationService.MigrateAsync(
                     TxtFoxProFolder.Text,
                     connectionString,
@@ -122,21 +218,27 @@ namespace FoxProToMySqlMigrator
                     ChkSkipDeleted.IsChecked ?? true,
                     migrationMode,
                     batchSize,
+                    resumeFromCheckpoint,
                     _cancellationTokenSource.Token
                 );
 
                 if (!_cancellationTokenSource.Token.IsCancellationRequested)
                 {
                     MessageBox.Show("Migration completed successfully!", "Success", MessageBoxButton.OK, MessageBoxImage.Information);
+                    _currentCheckpoint = null;
                 }
             }
             catch (OperationCanceledException)
             {
-                MessageBox.Show("Migration was cancelled by user.", "Cancelled", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("Migration was cancelled. Progress has been saved and you can resume later.", "Cancelled", MessageBoxButton.OK, MessageBoxImage.Warning);
+                // Reload checkpoint after cancellation
+                CheckForExistingCheckpoint();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Migration error: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"Migration error: {ex.Message}\n\nProgress has been saved.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                // Reload checkpoint after error
+                CheckForExistingCheckpoint();
             }
             finally
             {
@@ -157,7 +259,8 @@ namespace FoxProToMySqlMigrator
             if (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
             {
                 var result = MessageBox.Show(
-                    "Are you sure you want to stop the migration? This may leave the database in an incomplete state.",
+                    "Are you sure you want to stop the migration?\n\n" +
+                    "Your progress will be saved and you can resume later.",
                     "Confirm Stop",
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning);
