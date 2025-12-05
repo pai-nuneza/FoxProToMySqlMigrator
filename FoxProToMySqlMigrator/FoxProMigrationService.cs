@@ -269,7 +269,7 @@ namespace FoxProToMySqlMigrator
             int batchSize,
             CancellationToken cancellationToken = default)
         {
-            var tableName = Path.GetFileNameWithoutExtension(dbfFilePath);
+            var tableName = Path.GetFileNameWithoutExtension(dbfFilePath).ToLower();
 
             try
             {
@@ -294,8 +294,9 @@ namespace FoxProToMySqlMigrator
                 using var dbfStream = new FileStream(dbfFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
                 using var dbfReader = new DbfDataReader.DbfDataReader(dbfStream, options);
 
-                Log($"  Opened DBF file: {tableName}.dbf" + 
+                Log($"  Opened DBF file: {Path.GetFileNameWithoutExtension(dbfFilePath)}.dbf" + 
                     (hasMemoFile ? $" (with {memoFileType} memo file)" : ""));
+                Log($"  MySQL table name: '{tableName}'");
 
                 var schema = GetTableSchema(dbfReader);
                 
@@ -406,6 +407,9 @@ namespace FoxProToMySqlMigrator
 
                 var columnDefs = new List<string>();
                 
+                // Add auto-increment primary key as first column
+                columnDefs.Add("`primary_id` INT AUTO_INCREMENT PRIMARY KEY");
+                
                 // Add regular columns
                 foreach (var col in schema)
                 {
@@ -415,16 +419,22 @@ namespace FoxProToMySqlMigrator
                 
                 // Add is_deleted column for DBF deletion flag
                 columnDefs.Add("`is_deleted` BOOLEAN DEFAULT FALSE");
+                
+                // Add index on is_deleted for faster queries
+                columnDefs.Add("INDEX `idx_is_deleted` (`is_deleted`)");
 
                 var createTableSql = $"CREATE TABLE `{tableName}` ({string.Join(", ", columnDefs)})";
                 var createCmd = new MySqlCommand(createTableSql, connection);
                 await createCmd.ExecuteNonQueryAsync(cancellationToken);
-                Log($"  Created table with {columnDefs.Count} columns (Full Reload)");
+                Log($"  Created table with AUTO_INCREMENT primary_id and {schema.Count} data columns (Full Reload)");
             }
             else
             {
                 // Patch Load - create table only if it doesn't exist
                 var columnDefs = new List<string>();
+                
+                // Add auto-increment primary key as first column
+                columnDefs.Add("`primary_id` INT AUTO_INCREMENT PRIMARY KEY");
                 
                 foreach (var col in schema)
                 {
@@ -433,11 +443,14 @@ namespace FoxProToMySqlMigrator
                 }
                 
                 columnDefs.Add("`is_deleted` BOOLEAN DEFAULT FALSE");
+                
+                // Add index on is_deleted for faster queries
+                columnDefs.Add("INDEX `idx_is_deleted` (`is_deleted`)");
 
                 var createTableSql = $"CREATE TABLE IF NOT EXISTS `{tableName}` ({string.Join(", ", columnDefs)})";
                 var createCmd = new MySqlCommand(createTableSql, connection);
                 await createCmd.ExecuteNonQueryAsync(cancellationToken);
-                Log($"  Verified table exists with {columnDefs.Count} columns (Patch Load)");
+                Log($"  Verified table exists with AUTO_INCREMENT primary_id and {schema.Count} data columns (Patch Load)");
             }
         }
 
@@ -531,7 +544,7 @@ namespace FoxProToMySqlMigrator
                 }
             }
             
-            // Build column names
+            // Build column names (excluding primary_id which is auto-increment)
             var allColumnNames = schema.Select(c => $"`{c.Name}`").ToList();
             allColumnNames.Add("`is_deleted`");
             var columnNames = string.Join(", ", allColumnNames);
@@ -618,7 +631,9 @@ namespace FoxProToMySqlMigrator
                         }
 
                         // OPTIMIZED: Collect rows for bulk insert
-                        var rowData = new object?[schema.Count + 1];
+                        var rowData = new object?[schema.Count + 1]; // +1 for is_deleted
+                        
+                        // Data columns
                         for (int i = 0; i < schema.Count; i++)
                         {
                             var value = dbfReader.GetValue(i);
@@ -637,6 +652,8 @@ namespace FoxProToMySqlMigrator
                                 rowData[i] = value;
                             }
                         }
+                        
+                        // Last column: is_deleted flag
                         rowData[schema.Count] = isDeleted;
                         
                         batchRows.Add(rowData);
