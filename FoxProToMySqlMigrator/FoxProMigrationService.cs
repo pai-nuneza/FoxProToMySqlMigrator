@@ -42,6 +42,10 @@ namespace FoxProToMySqlMigrator
         private string _skippedRecordsFolder = "";
         private string _migrationTimestamp = "";
         private string _checkpointFilePath = "";
+        
+        // Cache reflection lookups per table
+        private System.Reflection.PropertyInfo? _cachedDbfRecordProperty;
+        private System.Reflection.PropertyInfo? _cachedIsDeletedProperty;
 
         public async Task<MigrationCheckpoint?> LoadCheckpointAsync(string foxProFolder, string targetDatabase)
         {
@@ -189,6 +193,11 @@ namespace FoxProToMySqlMigrator
 
                     currentTable++;
                     Log($"[{currentTable}/{totalTables}] Processing table: {tableName}");
+                    
+                    // Reset reflection cache for each table
+                    _cachedDbfRecordProperty = null;
+                    _cachedIsDeletedProperty = null;
+                    
                     await MigrateTableAsync(dbfFile, mySqlConn, safeMode, skipDeletedRecords, migrationMode, batchSize, cancellationToken);
                     
                     // Update checkpoint after successful table migration
@@ -281,6 +290,7 @@ namespace FoxProToMySqlMigrator
                     Encoding = Encoding.GetEncoding(1252)
                 };
 
+                // Single pass through DBF - read schema and data together
                 using var dbfStream = new FileStream(dbfFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
                 using var dbfReader = new DbfDataReader.DbfDataReader(dbfStream, options);
 
@@ -289,7 +299,6 @@ namespace FoxProToMySqlMigrator
 
                 var schema = GetTableSchema(dbfReader);
                 
-                // Count memo fields
                 var memoFieldCount = schema.Count(c => c.ColumnType == typeof(string) && 
                     (c.OriginalName.EndsWith("_MEMO", StringComparison.OrdinalIgnoreCase) || 
                      c.Name.Contains("memo") || 
@@ -315,10 +324,9 @@ namespace FoxProToMySqlMigrator
                 
                 await CreateMySqlTableAsync(mySqlConn, tableName, schema, safeMode, migrationMode, cancellationToken);
 
-                dbfStream.Position = 0;
-                using var dbfReader2 = new DbfDataReader.DbfDataReader(dbfStream, options);
-                var (rowCount, errorCount, deletedCount, skippedCount) = await CopyDataAsync(
-                    dbfReader2, mySqlConn, tableName, schema, safeMode, skipDeletedRecords, migrationMode, batchSize, cancellationToken);
+                // Use optimized bulk insert for large tables
+                var (rowCount, errorCount, deletedCount, skippedCount) = await CopyDataBulkAsync(
+                    dbfReader, mySqlConn, tableName, schema, safeMode, skipDeletedRecords, migrationMode, batchSize, cancellationToken);
                 
                 Log($"  ✓ Completed: {rowCount} rows migrated" + 
                     (skippedCount > 0 ? $", {skippedCount} deleted records skipped" : "") +
@@ -490,7 +498,8 @@ namespace FoxProToMySqlMigrator
             }
         }
 
-        private async Task<(int rowCount, int errorCount, int deletedCount, int skippedCount)> CopyDataAsync(
+        // OPTIMIZED: Bulk insert method for 80k+ records
+        private async Task<(int rowCount, int errorCount, int deletedCount, int skippedCount)> CopyDataBulkAsync(
             DbfDataReader.DbfDataReader dbfReader, 
             MySqlConnection mySqlConn, 
             string tableName, 
@@ -506,38 +515,34 @@ namespace FoxProToMySqlMigrator
             var deletedCount = 0;
             var skippedCount = 0;
             var recordNumber = 0;
-            var currentBatchCount = 0;
             var batchNumber = 0;
             
-            // Build column names including is_deleted
+            // Initialize reflection cache once per table
+            if (_cachedDbfRecordProperty == null)
+            {
+                _cachedDbfRecordProperty = dbfReader.GetType().GetProperty("DbfRecord");
+                if (_cachedDbfRecordProperty != null)
+                {
+                    var sampleRecord = _cachedDbfRecordProperty.GetValue(dbfReader);
+                    if (sampleRecord != null)
+                    {
+                        _cachedIsDeletedProperty = sampleRecord.GetType().GetProperty("IsDeleted");
+                    }
+                }
+            }
+            
+            // Build column names
             var allColumnNames = schema.Select(c => $"`{c.Name}`").ToList();
             allColumnNames.Add("`is_deleted`");
             var columnNames = string.Join(", ", allColumnNames);
             
-            // Build parameter names
-            var paramCount = schema.Count + 1;
-            var paramNames = string.Join(", ", Enumerable.Range(0, paramCount).Select(i => $"@p{i}"));
-            
-            // Determine the INSERT statement based on migration mode
-            string insertSql;
-            if (migrationMode == MigrationMode.PatchLoad)
-            {
-                insertSql = $"INSERT IGNORE INTO `{tableName}` ({columnNames}) VALUES ({paramNames})";
-            }
-            else
-            {
-                insertSql = $"INSERT INTO `{tableName}` ({columnNames}) VALUES ({paramNames})";
-            }
-
-            // Create CSV file for skipped records
-            string? skippedRecordsCsvPath = null;
             StreamWriter? skippedRecordsCsv = null;
-            
-            // Create CSV file for error records
-            string? errorRecordsCsvPath = null;
             StreamWriter? errorRecordsCsv = null;
+            string? skippedRecordsCsvPath = null;
+            string? errorRecordsCsvPath = null;
 
             MySqlTransaction? transaction = null;
+            var batchRows = new List<object?[]>();
             
             try
             {
@@ -549,40 +554,26 @@ namespace FoxProToMySqlMigrator
                         cancellationToken.ThrowIfCancellationRequested();
                     }
 
-                    // Start a new transaction if needed
-                    if (transaction == null)
-                    {
-                        batchNumber++;
-                        transaction = await mySqlConn.BeginTransactionAsync(cancellationToken);
-                        currentBatchCount = 0;
-                        Log($"  → Starting batch #{batchNumber} (processing up to {batchSize} records)...");
-                    }
-
                     recordNumber++;
                     
                     try
                     {
-                        // Check if record is deleted
+                        // OPTIMIZED: Use cached reflection
                         bool isDeleted = false;
-                        try
+                        if (_cachedDbfRecordProperty != null && _cachedIsDeletedProperty != null)
                         {
-                            var dbfRecordProperty = dbfReader.GetType().GetProperty("DbfRecord");
-                            if (dbfRecordProperty != null)
+                            try
                             {
-                                var dbfRecord = dbfRecordProperty.GetValue(dbfReader);
+                                var dbfRecord = _cachedDbfRecordProperty.GetValue(dbfReader);
                                 if (dbfRecord != null)
                                 {
-                                    var isDeletedProperty = dbfRecord.GetType().GetProperty("IsDeleted");
-                                    if (isDeletedProperty != null)
-                                    {
-                                        isDeleted = (bool)(isDeletedProperty.GetValue(dbfRecord) ?? false);
-                                    }
+                                    isDeleted = (bool)(_cachedIsDeletedProperty.GetValue(dbfRecord) ?? false);
                                 }
                             }
-                        }
-                        catch
-                        {
-                            // Silently ignore if we can't read deletion flag
+                            catch
+                            {
+                                // Silently ignore
+                            }
                         }
 
                         // Skip deleted records if option is enabled
@@ -626,57 +617,52 @@ namespace FoxProToMySqlMigrator
                             deletedCount++;
                         }
 
-                        using var insertCmd = new MySqlCommand(insertSql, mySqlConn, transaction);
-                        
-                        // Add regular column values
+                        // OPTIMIZED: Collect rows for bulk insert
+                        var rowData = new object?[schema.Count + 1];
                         for (int i = 0; i < schema.Count; i++)
                         {
                             var value = dbfReader.GetValue(i);
                             
                             if (value == null || value == DBNull.Value)
                             {
-                                insertCmd.Parameters.AddWithValue($"@p{i}", DBNull.Value);
+                                rowData[i] = DBNull.Value;
                             }
-                            else if (value is string strValue)
+                            else if (value is string strValue && safeMode)
                             {
-                                if (safeMode)
-                                {
-                                    // Clean the string
-                                    strValue = strValue.Replace("\0", "").Trim();
-                                    
-                                    // Check if string is too long for VARCHAR(500)
-                                    if (strValue.Length > 500)
-                                    {
-                                        // Log warning about long string (only once per column per batch)
-                                        if (currentBatchCount == 0)
-                                        {
-                                            Log($"    ⚠️ Column '{schema[i].Name}' has data > 500 chars (length: {strValue.Length})");
-                                        }
-                                    }
-                                }
-                                
-                                insertCmd.Parameters.AddWithValue($"@p{i}", strValue);
+                                // OPTIMIZED: Simplified string cleaning
+                                rowData[i] = strValue.Replace("\0", "").Trim();
                             }
                             else
                             {
-                                insertCmd.Parameters.AddWithValue($"@p{i}", value);
+                                rowData[i] = value;
                             }
                         }
+                        rowData[schema.Count] = isDeleted;
                         
-                        insertCmd.Parameters.AddWithValue($"@p{schema.Count}", isDeleted);
-                        await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+                        batchRows.Add(rowData);
                         rowCount++;
-                        currentBatchCount++;
 
-                        // Commit batch and start new transaction
-                        if (currentBatchCount >= batchSize)
+                        // OPTIMIZED: Execute bulk insert when batch is full
+                        if (batchRows.Count >= batchSize)
                         {
+                            if (transaction == null)
+                            {
+                                batchNumber++;
+                                transaction = await mySqlConn.BeginTransactionAsync(cancellationToken);
+                            }
+
+                            Log($"  → Processing batch #{batchNumber} ({batchRows.Count} records)...");
+                            
+                            await ExecuteBulkInsertAsync(mySqlConn, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken);
+                            
                             await transaction.CommitAsync(cancellationToken);
                             await transaction.DisposeAsync();
                             transaction = null;
                             
-                            Log($"  ✓ Batch #{batchNumber} committed: {currentBatchCount} records saved to database");
-                            Log($"  📊 Total progress: {rowCount} rows migrated so far");
+                            Log($"  ✓ Batch #{batchNumber} committed: {batchRows.Count} records saved");
+                            Log($"  📊 Total progress: {rowCount} rows migrated");
+                            
+                            batchRows.Clear();
                         }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
@@ -734,12 +720,23 @@ namespace FoxProToMySqlMigrator
                     }
                 }
                 
-                // Commit any remaining records in the last batch
-                if (transaction != null && currentBatchCount > 0)
+                // Commit remaining records
+                if (batchRows.Count > 0)
                 {
+                    if (transaction == null)
+                    {
+                        batchNumber++;
+                        transaction = await mySqlConn.BeginTransactionAsync(cancellationToken);
+                    }
+
+                    Log($"  → Processing final batch #{batchNumber} ({batchRows.Count} records)...");
+                    
+                    await ExecuteBulkInsertAsync(mySqlConn, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken);
+                    
                     await transaction.CommitAsync(cancellationToken);
                     await transaction.DisposeAsync();
-                    Log($"  ✓ Final batch #{batchNumber} committed: {currentBatchCount} records saved to database");
+                    
+                    Log($"  ✓ Final batch committed: {batchRows.Count} records saved");
                     Log($"  📊 Migration complete: {rowCount} total rows migrated");
                 }
             }
@@ -749,7 +746,7 @@ namespace FoxProToMySqlMigrator
                 {
                     await transaction.RollbackAsync();
                     await transaction.DisposeAsync();
-                    Log($"  ❌ Batch #{batchNumber} rolled back due to cancellation (last {currentBatchCount} records not saved)");
+                    Log($"  ❌ Batch rolled back due to cancellation");
                 }
                 throw;
             }
@@ -760,7 +757,7 @@ namespace FoxProToMySqlMigrator
                     await transaction.RollbackAsync();
                     await transaction.DisposeAsync();
                 }
-                Log($"  ❌ Batch #{batchNumber} rolled back due to error: {ex.Message}");
+                Log($"  ❌ Batch rolled back due to error: {ex.Message}");
                 LogError(tableName, "Transaction", ex.Message, ex.StackTrace ?? "");
                 throw;
             }
@@ -783,6 +780,61 @@ namespace FoxProToMySqlMigrator
             }
 
             return (rowCount, errorCount, deletedCount, skippedCount);
+        }
+
+        // OPTIMIZED: Multi-value INSERT for bulk operations
+        private async Task ExecuteBulkInsertAsync(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            string tableName,
+            string columnNames,
+            List<DbfColumnInfo> schema,
+            List<object?[]> rows,
+            MigrationMode migrationMode,
+            CancellationToken cancellationToken)
+        {
+            if (rows.Count == 0) return;
+
+            var sql = new StringBuilder();
+            
+            if (migrationMode == MigrationMode.PatchLoad)
+            {
+                sql.Append($"INSERT IGNORE INTO `{tableName}` ({columnNames}) VALUES ");
+            }
+            else
+            {
+                sql.Append($"INSERT INTO `{tableName}` ({columnNames}) VALUES ");
+            }
+
+            using var cmd = new MySqlCommand("", connection, transaction);
+            cmd.CommandTimeout = 300; // 5 minutes for large batches
+            
+            for (int rowIdx = 0; rowIdx < rows.Count; rowIdx++)
+            {
+                if (rowIdx > 0)
+                {
+                    sql.Append(',');
+                }
+                
+                sql.Append('(');
+                
+                for (int colIdx = 0; colIdx < rows[rowIdx].Length; colIdx++)
+                {
+                    if (colIdx > 0)
+                    {
+                        sql.Append(',');
+                    }
+                    
+                    var paramName = $"@p{rowIdx}_{colIdx}";
+                    sql.Append(paramName);
+                    cmd.Parameters.AddWithValue(paramName, rows[rowIdx][colIdx] ?? DBNull.Value);
+                }
+                
+                sql.Append(')');
+            }
+
+            cmd.CommandText = sql.ToString();
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
         }
 
         private string EscapeCsvValue(string? value)
