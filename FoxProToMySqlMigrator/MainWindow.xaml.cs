@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Microsoft.Win32;
+using FoxProToMySqlMigrator.Models;
 
 namespace FoxProToMySqlMigrator
 {
@@ -16,6 +17,8 @@ namespace FoxProToMySqlMigrator
         private bool _isMigrating;
         private CancellationTokenSource? _cancellationTokenSource;
         private MigrationCheckpoint? _currentCheckpoint;
+        private System.Timers.Timer? _watchdogTimer;
+        private DateTime _lastLogUpdate;
 
         public MainWindow()
         {
@@ -25,6 +28,39 @@ namespace FoxProToMySqlMigrator
             _migrationService.TableCompleted += OnTableCompleted;
             
             LoadDefaultSettings();
+            SetupWatchdog();
+        }
+
+        private void SetupWatchdog()
+        {
+            _watchdogTimer = new System.Timers.Timer(30000); // Check every 30 seconds
+            _watchdogTimer.Elapsed += (s, e) =>
+            {
+                if (_isMigrating && (DateTime.Now - _lastLogUpdate).TotalMinutes > 5)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        var result = MessageBox.Show(
+                            "⚠️ MIGRATION APPEARS FROZEN\n\n" +
+                            "No activity detected for 5 minutes.\n" +
+                            "This may indicate:\n" +
+                            "• Database connection timeout\n" +
+                            "• Network issues\n" +
+                            "• Very large batch processing\n\n" +
+                            "Your progress has been saved.\n\n" +
+                            "Click OK to stop the migration and restart the application.\n" +
+                            "Click Cancel to keep waiting.",
+                            "Migration May Be Frozen",
+                            MessageBoxButton.OKCancel,
+                            MessageBoxImage.Warning);
+
+                        if (result == MessageBoxResult.OK)
+                        {
+                            _cancellationTokenSource?.Cancel();
+                        }
+                    });
+                }
+            };
         }
 
         private void LoadDefaultSettings()
@@ -192,7 +228,11 @@ namespace FoxProToMySqlMigrator
             try
             {
                 _isMigrating = true;
+                _lastLogUpdate = DateTime.Now;
                 _cancellationTokenSource = new CancellationTokenSource();
+                
+                // Start watchdog
+                _watchdogTimer?.Start();
                 
                 // Update UI
                 BtnMigrate.IsEnabled = false;
@@ -230,19 +270,56 @@ namespace FoxProToMySqlMigrator
             }
             catch (OperationCanceledException)
             {
-                MessageBox.Show("Migration was cancelled. Progress has been saved and you can resume later.", "Cancelled", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(
+                    "Migration was cancelled. Progress has been saved and you can resume later.", 
+                    "Cancelled", 
+                    MessageBoxButton.OK, 
+                    MessageBoxImage.Warning);
                 // Reload checkpoint after cancellation
+                CheckForExistingCheckpoint();
+            }
+            catch (TimeoutException tex)
+            {
+                var errorMessage = $"⏱️ TIMEOUT ERROR\n\n" +
+                                  $"{tex.Message}\n\n" +
+                                  $"✅ Your progress has been saved!\n" +
+                                  $"✅ You can safely close and restart the application\n" +
+                                  $"✅ Resume migration later from where it stopped\n\n" +
+                                  $"💡 Try:\n" +
+                                  $"• Reducing batch size (currently {TxtBatchSize.Text})\n" +
+                                  $"• Checking database server performance\n" +
+                                  $"• Checking network connection\n\n" +
+                                  $"📁 Check the log files on your Desktop for more details:\n" +
+                                  $"   FoxProMySqlMigrator_Logs folder";
+                
+                MessageBox.Show(errorMessage, "Migration Timeout - Safe to Restart", MessageBoxButton.OK, MessageBoxImage.Error);
                 CheckForExistingCheckpoint();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Migration error: {ex.Message}\n\nProgress has been saved.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                var errorMessage = $"⚠️ MIGRATION ERROR\n\n" +
+                                  $"Error: {ex.Message}\n\n";
+                
+                if (ex.InnerException != null)
+                {
+                    errorMessage += $"Details: {ex.InnerException.Message}\n\n";
+                }
+                
+                errorMessage += $"✅ Your progress has been saved!\n" +
+                               $"✅ You can safely close and restart the application\n" +
+                               $"✅ Resume migration later from where it stopped\n\n" +
+                               $"📁 Check the log files on your Desktop for more details:\n" +
+                               $"   FoxProMySqlMigrator_Logs folder";
+                
+                MessageBox.Show(errorMessage, "Migration Error - Safe to Restart", MessageBoxButton.OK, MessageBoxImage.Error);
+                
                 // Reload checkpoint after error
                 CheckForExistingCheckpoint();
             }
             finally
             {
                 _isMigrating = false;
+                _watchdogTimer?.Stop();
                 _cancellationTokenSource?.Dispose();
                 _cancellationTokenSource = null;
                 
@@ -289,6 +366,9 @@ namespace FoxProToMySqlMigrator
                 {
                     LstLog.ScrollIntoView(LstLog.Items[LstLog.Items.Count - 1]);
                 }
+                
+                // Update watchdog - we received activity
+                _lastLogUpdate = DateTime.Now;
             });
         }
 

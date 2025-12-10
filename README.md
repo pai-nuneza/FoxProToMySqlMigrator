@@ -184,13 +184,32 @@ This ensures consistency and follows common MySQL naming conventions. The log wi
 
 | .NET Type (from DBF) | MySQL Type (Safe Mode OFF) | MySQL Type (Safe Mode ON) |
 |----------------------|---------------------------|---------------------------|
-| string               | VARCHAR(255)              | TEXT                      |
+| string               | VARCHAR(255)              | TEXT (up to 65,535 chars) |
 | int / long           | INT                       | INT                       |
 | decimal              | DECIMAL(18,4)             | DECIMAL(18,4)             |
 | double / float       | DOUBLE                    | DOUBLE                    |
 | DateTime             | DATETIME                  | DATETIME                  |
 | bool                 | BOOLEAN                   | BOOLEAN                   |
 | byte[]               | BLOB                      | BLOB                      |
+
+### Important: Safe Mode vs Non-Safe Mode
+
+**Safe Mode ON (RECOMMENDED - Default):**
+- ? All string fields use TEXT data type
+- ? Prevents "Data too long for column" errors
+- ? Handles any string length (up to 65,535 characters)
+- ? Perfect for unknown data lengths in legacy systems
+- ?? Slightly slower indexing compared to VARCHAR
+- ?? Cannot be used in PRIMARY KEY or UNIQUE constraints
+
+**Safe Mode OFF:**
+- ?? String fields use VARCHAR(255)
+- ? **WILL FAIL** if any string exceeds 255 characters
+- ? Faster for indexing and searching
+- ? Can be used in PRIMARY KEY or UNIQUE constraints
+- ?? Only use if you're 100% sure all strings are ?255 chars
+
+**Recommendation:** Always use Safe Mode unless you have a specific reason not to and have verified all string data is under 255 characters.
 
 ## Migration Process
 
