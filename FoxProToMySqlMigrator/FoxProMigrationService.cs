@@ -247,7 +247,7 @@ namespace FoxProToMySqlMigrator
 
                     var schema = schemaReader.GetTableSchema(dbfReader);
                     
-                    LogSchemaInfo(schema, schemaReader);
+                    LogSchemaInfo(schema, schemaReader, safeMode);
                     
                     var tableService = new MySqlTableService();
                     await tableService.CreateTableAsync(mySqlConn, tableName, schema, safeMode, migrationMode, cancellationToken);
@@ -305,26 +305,44 @@ namespace FoxProToMySqlMigrator
             }
         }
 
-        private void LogSchemaInfo(List<DbfColumnInfo> schema, DbfSchemaReader schemaReader)
+        private void LogSchemaInfo(List<DbfColumnInfo> schema, DbfSchemaReader schemaReader, bool safeMode)
         {
             var largeTextFieldCount = schemaReader.CountLargeTextFields(schema);
+            var typeMapper = new MySqlTypeMapper();
             
             _logger!.Log($"  Columns found: {schema.Count} columns" + 
                 (largeTextFieldCount > 0 ? $" ({largeTextFieldCount} large text field(s) → TEXT)" : ""));
             
             foreach (var col in schema)
             {
-                var isLargeTextField = schemaReader.IsLargeTextField(col);
-                string typeInfo = col.ColumnType.Name;
+                // Show the DBF native type
+                string dbfType = GetDbfTypeDescription(col.DbfFieldType, col.Length, col.DecimalCount);
                 
-                if (col.ColumnType == typeof(string))
-                {
-                    typeInfo = isLargeTextField ? "String → TEXT" : "String → VARCHAR(500)";
-                }
+                // Show what MySQL type it will be mapped to (use actual safeMode setting)
+                string mySqlType = typeMapper.MapToMySqlType(col, safeMode);
                 
-                _logger.Log($"    - '{col.OriginalName}' -> '{col.Name}' ({typeInfo})");
+                _logger.Log($"    - '{col.OriginalName}' -> '{col.Name}' (DBF: {dbfType} → MySQL: {mySqlType})");
             }
-            _logger.Log($"    - DBF Deletion Flag -> 'is_deleted' (Boolean)");
+            _logger.Log($"    - DBF Deletion Flag -> 'is_deleted' (Boolean → BOOLEAN)");
+        }
+        
+        private string GetDbfTypeDescription(char dbfType, int length, int decimalCount)
+        {
+            return dbfType switch
+            {
+                'C' => $"Character({length})",
+                'N' => decimalCount > 0 ? $"Numeric({length},{decimalCount})" : $"Numeric({length})",
+                'F' => "Float",
+                'D' => "Date",
+                'T' => "DateTime",
+                'L' => "Logical",
+                'M' => "Memo",
+                'G' => "General",
+                'I' => "Integer",
+                'Y' => "Currency",
+                'B' => "Double",
+                _ => $"Unknown({dbfType})"
+            };
         }
 
         private async Task<(int rowCount, int errorCount, int deletedCount, int skippedCount)> CopyDataBulkAsync(
@@ -398,11 +416,9 @@ namespace FoxProToMySqlMigrator
                             }
                             catch (Exception batchEx)
                             {
-                                // Critical: Batch processing failed
                                 _logger!.Log($"  ❌ CRITICAL: Batch processing failed at batch #{batchNumber}");
                                 _logger.Log($"  Error: {batchEx.Message}");
                                 
-                                // Cleanup transaction
                                 if (transaction != null)
                                 {
                                     try
@@ -415,8 +431,6 @@ namespace FoxProToMySqlMigrator
                                 }
                                 
                                 batchRows.Clear();
-                                
-                                // Re-throw to stop migration of this table
                                 throw new Exception($"Batch processing failed at batch #{batchNumber}. This usually indicates a database connection issue or data corruption.", batchEx);
                             }
                         }
@@ -426,7 +440,6 @@ namespace FoxProToMySqlMigrator
                         errorCount++;
                         HandleRecordError(recordNumber, dbfReader, schema, ex, tableName, recordTracking);
                         
-                        // CRITICAL FIX: Rollback and dispose transaction on record error
                         if (transaction != null)
                         {
                             try
@@ -434,19 +447,14 @@ namespace FoxProToMySqlMigrator
                                 await transaction.RollbackAsync();
                                 await transaction.DisposeAsync();
                             }
-                            catch
-                            {
-                                // Ignore rollback errors
-                            }
+                            catch { }
                             transaction = null;
                         }
                         
-                        // Clear batch to start fresh after error
                         batchRows.Clear();
                     }
                 }
                 
-                // Commit remaining records
                 if (batchRows.Count > 0)
                 {
                     try
@@ -493,8 +501,6 @@ namespace FoxProToMySqlMigrator
                 }
                 _logger!.Log($"  ❌ Batch rolled back due to error: {ex.Message}");
                 _logger.LogError(tableName, "Transaction", ex.Message, ex.StackTrace ?? "");
-                
-                // Re-throw with better context
                 throw new Exception($"Migration failed for table '{tableName}' at record #{recordNumber}. Check error logs for details.", ex);
             }
 
@@ -537,10 +543,7 @@ namespace FoxProToMySqlMigrator
                         isDeleted = (bool)(_cachedIsDeletedProperty.GetValue(dbfRecord) ?? false);
                     }
                 }
-                catch
-                {
-                    // Silently ignore
-                }
+                catch { }
             }
             return isDeleted;
         }

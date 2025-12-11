@@ -14,56 +14,99 @@ namespace FoxProToMySqlMigrator.Services
 
         public string MapToMySqlType(DbfColumnInfo column, bool safeMode)
         {
-            if (column.ColumnType == typeof(string))
+            // Use native DBF field type for accurate mapping
+            // DBF Field Types:
+            // C = Character (string)
+            // N = Numeric (can be integer or decimal)
+            // F = Float
+            // D = Date
+            // T = DateTime
+            // L = Logical (boolean)
+            // M = Memo (large text)
+            // G = General (blob/binary)
+            // I = Integer
+            // Y = Currency
+            // B = Double
+            
+            switch (column.DbfFieldType)
             {
-                if (safeMode)
-                {
-                    // Check if this is likely a large text field
+                case 'D': // Date field
+                    return "DATE";
+                
+                case 'T': // DateTime field
+                    return "DATETIME";
+                
+                case 'L': // Logical/Boolean field
+                    return "BOOLEAN";
+                
+                case 'I': // Integer field
+                    return "INT";
+                
+                case 'N': // Numeric field - could be integer or decimal
+                    if (column.DecimalCount > 0)
+                    {
+                        // Has decimal places - use DECIMAL
+                        return $"DECIMAL({column.Length},{column.DecimalCount})";
+                    }
+                    else if (column.Length <= 10)
+                    {
+                        // No decimal, length <= 10 - likely an integer
+                        return "INT";
+                    }
+                    else
+                    {
+                        // No decimal, length > 10 - use BIGINT for safety
+                        return "BIGINT";
+                    }
+                
+                case 'F': // Float field
+                case 'B': // Double field
+                    return "DOUBLE";
+                
+                case 'Y': // Currency field
+                    return "DECIMAL(19,4)"; // Standard for currency
+                
+                case 'M': // Memo field - always large text
+                    return "TEXT";
+                
+                case 'G': // General/Binary field
+                    return "BLOB";
+                
+                case 'C': // Character field
+                default:  // Default to character handling
+                    // Check if this is a memo-like field
                     if (IsLargeTextField(column))
                     {
-                        // TEXT for large fields (up to 64KB) - good balance for reporting
-                        // Using TEXT instead of MEDIUMTEXT for better performance
                         return "TEXT";
                     }
                     
-                    // Regular string fields - use VARCHAR(500) for optimal reporting performance
-                    // VARCHAR is indexed-friendly and perfect for WHERE, JOIN, ORDER BY clauses
-                    return "VARCHAR(500)";
-                }
-                else
-                {
-                    // Safe mode OFF - strict VARCHAR(255)
-                    // Maximum performance for reports with strict data limits
-                    return "VARCHAR(255)";
-                }
-            }
-            else if (column.ColumnType == typeof(int) || column.ColumnType == typeof(long))
-            {
-                return "INT";
-            }
-            else if (column.ColumnType == typeof(decimal))
-            {
-                return "DECIMAL(18,4)";
-            }
-            else if (column.ColumnType == typeof(double) || column.ColumnType == typeof(float))
-            {
-                return "DOUBLE";
-            }
-            else if (column.ColumnType == typeof(DateTime))
-            {
-                return "DATETIME";
-            }
-            else if (column.ColumnType == typeof(bool))
-            {
-                return "BOOLEAN";
-            }
-            else if (column.ColumnType == typeof(byte[]))
-            {
-                return "BLOB";
-            }
-            else
-            {
-                return "TEXT";
+                    // Use the actual DBF field length from FoxPro
+                    int fieldLength = column.Length > 0 ? column.Length : 255;
+                    
+                    if (safeMode)
+                    {
+                        // Safe mode: Add buffer to prevent truncation (20% extra or min +50)
+                        int safeLength = Math.Max(fieldLength + 50, (int)(fieldLength * 1.2));
+                        
+                        // Cap at 65535 (TEXT range), use TEXT if exceeds VARCHAR max
+                        if (safeLength > 65535)
+                        {
+                            return "TEXT";
+                        }
+                        
+                        return $"VARCHAR({safeLength})";
+                    }
+                    else
+                    {
+                        // Safe mode OFF - use exact FoxPro field length
+                        // Cap at 65535 (VARCHAR max in MySQL)
+                        if (fieldLength > 65535)
+                        {
+                            return "TEXT";
+                        }
+                        
+                        return $"VARCHAR({fieldLength})";
+                    }
             }
         }
 

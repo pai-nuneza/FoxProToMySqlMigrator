@@ -11,7 +11,8 @@ namespace FoxProToMySqlMigrator
         // Full connection string (server + database)
         public static string DefaultConnectionString => $"{DefaultServerConnection}Database={DefaultDatabaseName};";
         
-        public const bool DefaultSafeMode = true;
+        // Safe Mode OFF by default - uses exact FoxPro field lengths for accurate migration
+        public const bool DefaultSafeMode = false;
         public const bool DefaultSkipDeletedRecords = true;
     }
 }
