@@ -19,6 +19,7 @@ namespace FoxProToMySqlMigrator
         private MigrationCheckpoint? _currentCheckpoint;
         private System.Timers.Timer? _watchdogTimer;
         private DateTime _lastLogUpdate;
+        private bool _frozenAlertShown;
 
         public MainWindow()
         {
@@ -36,8 +37,9 @@ namespace FoxProToMySqlMigrator
             _watchdogTimer = new System.Timers.Timer(30000); // Check every 30 seconds
             _watchdogTimer.Elapsed += (s, e) =>
             {
-                if (_isMigrating && (DateTime.Now - _lastLogUpdate).TotalMinutes > 5)
+                if (_isMigrating && !_frozenAlertShown && (DateTime.Now - _lastLogUpdate).TotalMinutes > 5)
                 {
+                    _frozenAlertShown = true;
                     Dispatcher.Invoke(() =>
                     {
                         var result = MessageBox.Show(
@@ -229,6 +231,7 @@ namespace FoxProToMySqlMigrator
             {
                 _isMigrating = true;
                 _lastLogUpdate = DateTime.Now;
+                _frozenAlertShown = false;
                 _cancellationTokenSource = new CancellationTokenSource();
                 
                 // Start watchdog
@@ -369,6 +372,7 @@ namespace FoxProToMySqlMigrator
                 
                 // Update watchdog - we received activity
                 _lastLogUpdate = DateTime.Now;
+                _frozenAlertShown = false;
             });
         }
 
