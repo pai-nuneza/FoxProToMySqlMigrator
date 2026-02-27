@@ -67,7 +67,7 @@ namespace FoxProToMySqlMigrator.Services
                     return "DECIMAL(19,4)"; // Standard for currency
                 
                 case 'M': // Memo field - always large text
-                    return "TEXT";
+                    return "LONGTEXT";
                 
                 case 'G': // General/Binary field
                     return "BLOB";
@@ -77,7 +77,7 @@ namespace FoxProToMySqlMigrator.Services
                     // Check if this is a memo-like field
                     if (IsLargeTextField(column))
                     {
-                        return "TEXT";
+                        return "LONGTEXT";
                     }
                     
                     // Use the actual DBF field length from FoxPro
@@ -91,7 +91,7 @@ namespace FoxProToMySqlMigrator.Services
                         // Cap at 65535 (TEXT range), use TEXT if exceeds VARCHAR max
                         if (safeLength > 65535)
                         {
-                            return "TEXT";
+                            return "LONGTEXT";
                         }
                         
                         return $"VARCHAR({safeLength})";
@@ -102,7 +102,7 @@ namespace FoxProToMySqlMigrator.Services
                         // Cap at 65535 (VARCHAR max in MySQL)
                         if (fieldLength > 65535)
                         {
-                            return "TEXT";
+                            return "LONGTEXT";
                         }
                         
                         return $"VARCHAR({fieldLength})";

@@ -39,13 +39,13 @@ namespace FoxProToMySqlMigrator.Helpers
         {
             var recordData = new List<string> { recordNumber.ToString() };
             recordData.AddRange(columnData.Select(c => EscapeCsvValue(c.value)));
-            recordData.Add(reason);
+            recordData.Add(EscapeCsvValue(reason));
             writer.WriteLine(string.Join(",", recordData));
         }
 
         public static string CreateCsvHeader(List<string> columnNames, string additionalColumn)
         {
-            return "RecordNumber," + string.Join(",", columnNames.Select(EscapeCsvValue)) + "," + additionalColumn;
+            return "RecordNumber," + string.Join(",", columnNames.Select(EscapeCsvValue)) + "," + EscapeCsvValue(additionalColumn);
         }
     }
 }

@@ -406,14 +406,16 @@ namespace FoxProToMySqlMigrator
 
                         if (batchRows.Count >= batchSize)
                         {
-                            try
-                            {
-                                transaction = await ProcessBatch(
-                                    mySqlConn, transaction, tableName, columnNames, schema, 
-                                    batchRows, migrationMode, ++batchNumber, rowCount, 
-                                    bulkInsertService, cancellationToken);
-                                batchRows.Clear();
-                            }
+                    try
+                    {
+                        var (newTransaction, skippedInBatch) = await ProcessBatch(
+                            mySqlConn, transaction, tableName, columnNames, schema,
+                            batchRows, migrationMode, ++batchNumber, rowCount,
+                            bulkInsertService, recordTracking, cancellationToken);
+                        transaction = newTransaction;
+                        skippedCount += skippedInBatch;
+                        batchRows.Clear();
+                    }
                             catch (Exception batchEx)
                             {
                                 _logger!.Log($"  ❌ CRITICAL: Batch processing failed at batch #{batchNumber}");
@@ -462,7 +464,7 @@ namespace FoxProToMySqlMigrator
                         await ProcessFinalBatch(
                             mySqlConn, transaction, tableName, columnNames, schema, 
                             batchRows, migrationMode, ++batchNumber, rowCount, 
-                            bulkInsertService, cancellationToken);
+                            bulkInsertService, recordTracking, cancellationToken);
                     }
                     catch (Exception finalEx)
                     {
@@ -578,7 +580,7 @@ namespace FoxProToMySqlMigrator
             return rowData;
         }
 
-        private async Task<MySqlTransaction?> ProcessBatch(
+        private async Task<(MySqlTransaction? transaction, int skippedCount)> ProcessBatch(
             MySqlConnection connection,
             MySqlTransaction? transaction,
             string tableName,
@@ -589,6 +591,7 @@ namespace FoxProToMySqlMigrator
             int batchNumber,
             int totalRowCount,
             BulkInsertService bulkInsertService,
+            RecordTrackingService recordTracking,
             CancellationToken cancellationToken)
         {
             if (transaction == null)
@@ -598,16 +601,42 @@ namespace FoxProToMySqlMigrator
 
             _logger!.Log($"  → Processing batch #{batchNumber} ({batchRows.Count} records)...");
             
-            await bulkInsertService.ExecuteBulkInsertAsync(
+            var skipped = await bulkInsertService.ExecuteBulkInsertAsync(
                 connection, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken);
-            
+
             await transaction.CommitAsync(cancellationToken);
             await transaction.DisposeAsync();
-            
+
             _logger.Log($"  ✓ Batch #{batchNumber} committed: {batchRows.Count} records saved");
             _logger.Log($"  📊 Total progress: {totalRowCount} rows migrated");
-            
-            return null;
+
+            // Log skipped rows (if any)
+            if (skipped != null && skipped.Count > 0)
+            {
+                foreach (var skippedItem in skipped)
+                {
+                    try
+                    {
+                        var idx = skippedItem.Index;
+                        var primaryId = skippedItem.PrimaryId;
+
+                        // Compute the original record number for this row in the batch
+                        var batchStartRecord = totalRowCount - batchRows.Count + 1;
+                        var recordNumber = batchStartRecord + idx;
+
+                        var reason = primaryId != null
+                            ? $"Skipped by INSERT IGNORE (possible duplicate). primary_id={primaryId}"
+                            : "Skipped by INSERT IGNORE (possible duplicate or constraint)";
+
+                        recordTracking.LogSkippedRowData(recordNumber, schema, batchRows[idx], reason);
+                    }
+                    catch { }
+                }
+
+                _logger.Log($"  ⚠️ {skipped.Count} record(s) skipped in batch #{batchNumber} (logged to skipped files)");
+            }
+
+            return (null, skipped?.Count ?? 0);
         }
 
         private async Task ProcessFinalBatch(
@@ -621,6 +650,7 @@ namespace FoxProToMySqlMigrator
             int batchNumber,
             int totalRowCount,
             BulkInsertService bulkInsertService,
+            RecordTrackingService recordTracking,
             CancellationToken cancellationToken)
         {
             if (transaction == null)
@@ -630,14 +660,37 @@ namespace FoxProToMySqlMigrator
 
             _logger!.Log($"  → Processing final batch #{batchNumber} ({batchRows.Count} records)...");
             
-            await bulkInsertService.ExecuteBulkInsertAsync(
+            var skipped = await bulkInsertService.ExecuteBulkInsertAsync(
                 connection, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken);
-            
+
             await transaction.CommitAsync(cancellationToken);
             await transaction.DisposeAsync();
-            
+
             _logger.Log($"  ✓ Final batch committed: {batchRows.Count} records saved");
             _logger.Log($"  📊 Migration complete: {totalRowCount} total rows migrated");
+
+            if (skipped != null && skipped.Count > 0)
+            {
+                foreach (var skippedItem in skipped)
+                {
+                    try
+                    {
+                        var idx = skippedItem.Index;
+                        var primaryId = skippedItem.PrimaryId;
+                        var batchStartRecord = totalRowCount - batchRows.Count + 1;
+                        var recordNumber = batchStartRecord + idx;
+
+                        var reason = primaryId != null
+                            ? $"Skipped by INSERT IGNORE (possible duplicate). primary_id={primaryId}"
+                            : "Skipped by INSERT IGNORE (possible duplicate or constraint)";
+
+                        recordTracking.LogSkippedRowData(recordNumber, schema, batchRows[idx], reason);
+                    }
+                    catch { }
+                }
+
+                _logger.Log($"  ⚠️ {skipped.Count} record(s) skipped in final batch (logged to skipped files)");
+            }
         }
 
         private void HandleRecordError(

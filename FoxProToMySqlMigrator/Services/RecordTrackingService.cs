@@ -23,6 +23,30 @@ namespace FoxProToMySqlMigrator.Services
             _tableName = tableName;
         }
 
+        public void LogSkippedRowData(int recordNumber, List<DbfColumnInfo> schema, object?[] rowData, string reason)
+        {
+            if (_skippedRecordsCsv == null)
+            {
+                InitializeSkippedRecordsCsv(schema);
+            }
+
+            var columnData = new List<(string columnName, string value)>();
+            for (int i = 0; i < schema.Count; i++)
+            {
+                try
+                {
+                    var val = rowData.Length > i ? rowData[i] : null;
+                    columnData.Add((schema[i].OriginalName, val?.ToString() ?? "NULL"));
+                }
+                catch
+                {
+                    columnData.Add((schema[i].OriginalName, "ERROR_READING_VALUE"));
+                }
+            }
+
+            CsvHelper.WriteSkippedRecord(_skippedRecordsCsv!, recordNumber, columnData, reason);
+        }
+
         public void LogSkippedRecord(
             int recordNumber,
             DbfDataReader.DbfDataReader dbfReader,
