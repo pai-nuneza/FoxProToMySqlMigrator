@@ -128,7 +128,8 @@ namespace FoxProToMySqlMigrator
             {
                 _logger?.Log($"CRITICAL ERROR: {ex.Message}");
                 _logger?.Log($"Stack trace: {ex.StackTrace}");
-                _logger?.LogError("CRITICAL", "Migration", ex.Message, ex.StackTrace ?? "");
+                // Include full exception details (including inner exceptions and MySqlException info)
+                _logger?.LogError("CRITICAL", "Migration", ex.Message, ex.ToString());
                 _logger?.Log($"💾 Progress saved! You can resume this migration later.");
                 throw; // Re-throw so UI can handle it
             }
@@ -291,7 +292,8 @@ namespace FoxProToMySqlMigrator
                 {
                     _logger.Log($"    Inner exception: {ex.InnerException.Message}");
                 }
-                _logger.LogError(tableName, "Table Migration", ex.Message, ex.StackTrace ?? "");
+                // Log full exception details (includes inner exceptions such as MySqlException)
+                _logger.LogError(tableName, "Table Migration", ex.Message, ex.ToString());
 
                 // Fire TableCompleted event with error
                 TableCompleted?.Invoke(new TableMigrationResult
@@ -600,9 +602,53 @@ namespace FoxProToMySqlMigrator
             }
 
             _logger!.Log($"  → Processing batch #{batchNumber} ({batchRows.Count} records)...");
-            
-            var skipped = await bulkInsertService.ExecuteBulkInsertAsync(
-                connection, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken);
+
+            List<(int Index, object? PrimaryId)> skipped;
+            try
+            {
+                skipped = (await bulkInsertService.ExecuteBulkInsertAsync(
+                    connection, transaction, tableName, columnNames, schema, batchRows, migrationMode, cancellationToken))
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                // Log full exception details immediately to make diagnostics easier
+                try
+                {
+                    _logger!.Log($"  ❌ Bulk insert failed at batch #{batchNumber}: {ex.Message}");
+                    _logger.Log($"  Exception details: {ex.ToString()}");
+                    _logger.LogError(tableName, $"Batch #{batchNumber}", ex.Message, ex.ToString());
+
+                    // Save problematic batch rows to skipped records for inspection
+                    try
+                    {
+                        var batchStartRecord = totalRowCount - batchRows.Count + 1;
+                        var reason = $"Batch #{batchNumber} failed: {ex.Message}";
+                        for (int i = 0; i < batchRows.Count; i++)
+                        {
+                            var recordNumber = batchStartRecord + i;
+                            recordTracking.LogSkippedRowData(recordNumber, schema, batchRows[i], reason);
+                        }
+                        _logger.Log($"  Saved {batchRows.Count} batch rows to skipped records for inspection");
+                    }
+                    catch { }
+                }
+                catch { }
+
+                // Rollback transaction if present then rethrow
+                if (transaction != null)
+                {
+                    try
+                    {
+                        await transaction.RollbackAsync();
+                        await transaction.DisposeAsync();
+                    }
+                    catch { }
+                    transaction = null;
+                }
+
+                throw;
+            }
 
             await transaction.CommitAsync(cancellationToken);
             await transaction.DisposeAsync();
@@ -717,7 +763,12 @@ namespace FoxProToMySqlMigrator
             }
             errorDetails.AppendLine($"Error: {ex.Message}");
             
-            _logger!.LogError(tableName, $"Record #{recordNumber}", ex.Message, errorDetails.ToString());
+            // Include full exception details alongside per-field dump for diagnosis
+            var fullDetails = new StringBuilder();
+            fullDetails.AppendLine(errorDetails.ToString());
+            fullDetails.AppendLine("Exception:");
+            fullDetails.AppendLine(ex.ToString());
+            _logger!.LogError(tableName, $"Record #{recordNumber}", ex.Message, fullDetails.ToString());
             recordTracking.LogErrorRecord(recordNumber, dbfReader, schema, ex.Message);
             _logger.Log($"  ⚠️ Error in record #{recordNumber}: {ex.Message} (logged to error files)");
         }

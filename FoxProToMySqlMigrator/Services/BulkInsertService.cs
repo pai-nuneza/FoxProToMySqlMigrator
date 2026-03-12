@@ -1,4 +1,9 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MySql.Data.MySqlClient;
 using FoxProToMySqlMigrator.Models;
 
@@ -16,12 +21,12 @@ namespace FoxProToMySqlMigrator.Services
             MigrationMode migrationMode,
             CancellationToken cancellationToken)
         {
-            if (rows.Count == 0) return new List<(int, object?)>();
+            if (rows == null || rows.Count == 0) return new List<(int, object?)>();
 
             try
             {
                 var sql = new StringBuilder();
-                
+
                 if (migrationMode == MigrationMode.PatchLoad)
                 {
                     sql.Append($"INSERT IGNORE INTO `{tableName}` ({columnNames}) VALUES ");
@@ -33,37 +38,33 @@ namespace FoxProToMySqlMigrator.Services
 
                 using var cmd = new MySqlCommand("", connection, transaction);
                 cmd.CommandTimeout = 600; // Increased to 10 minutes for very large batches
-                
+
                 for (int rowIdx = 0; rowIdx < rows.Count; rowIdx++)
                 {
                     if (rowIdx > 0)
-                    {
                         sql.Append(',');
-                    }
-                    
+
                     sql.Append('(');
-                    
+
                     for (int colIdx = 0; colIdx < rows[rowIdx].Length; colIdx++)
                     {
                         if (colIdx > 0)
-                        {
                             sql.Append(',');
-                        }
-                        
+
                         var paramName = $"@p{rowIdx}_{colIdx}";
                         sql.Append(paramName);
                         cmd.Parameters.AddWithValue(paramName, rows[rowIdx][colIdx] ?? DBNull.Value);
                     }
-                    
+
                     sql.Append(')');
                 }
 
                 cmd.CommandText = sql.ToString();
-                
+
                 // Add timeout protection with better error messaging
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-                
+
                 var skippedIndices = new List<(int Index, object? PrimaryId)>();
 
                 try
@@ -128,6 +129,32 @@ namespace FoxProToMySqlMigrator.Services
                         }
                     }
                 }
+                catch (MySqlException ex)
+                {
+                    // If a large batch failed, try to split and retry smaller batches to identify problematic rows
+                    if (rows.Count > 1)
+                    {
+                        int mid = rows.Count / 2;
+                        var firstHalf = rows.Take(mid).ToList();
+                        var secondHalf = rows.Skip(mid).ToList();
+
+                        var resultList = new List<(int Index, object? PrimaryId)>();
+                        var left = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, firstHalf, migrationMode, cancellationToken);
+                        resultList.AddRange(left);
+
+                        var right = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, secondHalf, migrationMode, cancellationToken);
+                        // adjust indices for the second half
+                        resultList.AddRange(right.Select(r => (r.Index + mid, r.PrimaryId)));
+
+                        return resultList;
+                    }
+                    else
+                    {
+                        // Single row failed - include row details for diagnostics
+                        string rowContent = FormatRowForLog(rows[0], schema);
+                        throw new Exception($"Bulk insert failed for a single row. MySQL error #{ex.Number}: {ex.Message}. Row: {rowContent}", ex);
+                    }
+                }
                 catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
                 {
                     throw new TimeoutException($"Bulk insert operation timed out after 10 minutes. This may indicate a database performance issue or network problem.");
@@ -147,12 +174,31 @@ namespace FoxProToMySqlMigrator.Services
                     2006 => "MySQL server has gone away (connection lost)",
                     _ => $"MySQL error #{ex.Number}: {ex.Message}"
                 };
-                
+
                 throw new Exception($"Database error during bulk insert to '{tableName}': {errorMessage}", ex);
             }
             catch (Exception ex) when (ex is not TimeoutException)
             {
                 throw new Exception($"Unexpected error during bulk insert to '{tableName}': {ex.Message}", ex);
+            }
+        }
+
+        private string FormatRowForLog(object?[] row, List<DbfColumnInfo> schema)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                for (int i = 0; i < Math.Min(schema.Count, row.Length); i++)
+                {
+                    var name = schema[i].Name;
+                    var val = row[i] == null || row[i] == DBNull.Value ? "NULL" : row[i].ToString();
+                    sb.AppendFormat("{0}={1}; ", name, val);
+                }
+                return sb.ToString();
+            }
+            catch
+            {
+                return "<unavailable>";
             }
         }
     }

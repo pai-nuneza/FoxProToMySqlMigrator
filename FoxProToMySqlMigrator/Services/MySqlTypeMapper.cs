@@ -9,7 +9,8 @@ namespace FoxProToMySqlMigrator.Services
             "memo", "note", "notes",  "comment", "description", "particular", 
             "remarks", "detail", "content", "text", "message",
             "body", "summary", "narrative", "observation", "review",
-            "address"  // Added address to large text fields
+            "address",  // Added address to large text fields
+            "name"      // Treat name-like fields as large text to avoid truncation
         };
 
         public string MapToMySqlType(DbfColumnInfo column, bool safeMode)
@@ -45,8 +46,11 @@ namespace FoxProToMySqlMigrator.Services
                 case 'N': // Numeric field - could be integer or decimal
                     if (column.DecimalCount > 0)
                     {
-                        // Has decimal places - use DECIMAL
-                        return $"DECIMAL({column.Length},{column.DecimalCount})";
+                        // Has decimal places - use a generous DECIMAL to avoid overflow/truncation
+                        // Use a safe precision (total digits) while keeping the original scale (decimal places)
+                        int precision = Math.Max(column.Length, 19);
+                        precision = Math.Min(precision, 65); // DECIMAL max precision in MySQL
+                        return $"DECIMAL({precision},{column.DecimalCount})";
                     }
                     else if (column.Length <= 10)
                     {

@@ -20,6 +20,9 @@ namespace FoxProToMySqlMigrator
         private System.Timers.Timer? _watchdogTimer;
         private DateTime _lastLogUpdate;
         private bool _frozenAlertShown;
+        private int _retryCount = 0;
+        private const int MaxRetries = 3;
+        private bool _shouldRetryRequested = false;
 
         public MainWindow()
         {
@@ -49,15 +52,17 @@ namespace FoxProToMySqlMigrator
                             "• Database connection timeout\n" +
                             "• Network issues\n" +
                             "• Very large batch processing\n\n" +
-                            "Your progress has been saved.\n\n" +
-                            "Click OK to stop the migration and restart the application.\n" +
-                            "Click Cancel to keep waiting.",
+                            "The app can attempt to retry the migration.\n\n" +
+                            "Click Yes to cancel and retry automatically.\n" +
+                            "Click No to keep waiting.",
                             "Migration May Be Frozen",
-                            MessageBoxButton.OKCancel,
+                            MessageBoxButton.YesNo,
                             MessageBoxImage.Warning);
 
-                        if (result == MessageBoxResult.OK)
+                        if (result == MessageBoxResult.Yes)
                         {
+                            // Request a retry; the cancellation handler will perform the restart after cleanup
+                            _shouldRetryRequested = true;
                             _cancellationTokenSource?.Cancel();
                         }
                     });
@@ -69,6 +74,7 @@ namespace FoxProToMySqlMigrator
         {
             TxtMySqlServer.Text = AppSettings.DefaultServerConnection;
             TxtDatabaseName.Text = AppSettings.DefaultDatabaseName;
+            TxtFoxProFolder.Text = AppSettings.DefaultFoxProFolder;
             TxtBatchSize.Text = "1000";
             ChkSafeMode.IsChecked = AppSettings.DefaultSafeMode;
             ChkSkipDeleted.IsChecked = AppSettings.DefaultSkipDeletedRecords;
@@ -168,6 +174,9 @@ namespace FoxProToMySqlMigrator
                 return;
             }
 
+            // Reset retry counter for a fresh user-initiated migration
+            _retryCount = 0;
+
             if (string.IsNullOrWhiteSpace(TxtFoxProFolder.Text))
             {
                 MessageBox.Show("Please select a FoxPro folder.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -227,6 +236,8 @@ namespace FoxProToMySqlMigrator
 
         private async Task StartMigrationAsync(MigrationCheckpoint? resumeFromCheckpoint)
         {
+            bool requestRetryAfterCleanup = false;
+            MigrationCheckpoint? checkpointToRetry = null;
             try
             {
                 _isMigrating = true;
@@ -273,13 +284,33 @@ namespace FoxProToMySqlMigrator
             }
             catch (OperationCanceledException)
             {
-                MessageBox.Show(
-                    "Migration was cancelled. Progress has been saved and you can resume later.", 
-                    "Cancelled", 
-                    MessageBoxButton.OK, 
-                    MessageBoxImage.Warning);
-                // Reload checkpoint after cancellation
-                CheckForExistingCheckpoint();
+                // If a watchdog requested a retry, we will attempt to restart after cleanup
+                if (_shouldRetryRequested)
+                {
+                    _shouldRetryRequested = false;
+                    _retryCount++;
+                    if (_retryCount <= MaxRetries)
+                    {
+                        requestRetryAfterCleanup = true;
+                        // Load the checkpoint to resume from where possible
+                        checkpointToRetry = await _migrationService.LoadCheckpointAsync(TxtFoxProFolder.Text, TxtDatabaseName.Text);
+                        OnLogMessage($"Watchdog requested retry #{_retryCount} of {MaxRetries}...");
+                    }
+                    else
+                    {
+                        MessageBox.Show($"Migration cancelled and maximum retries ({MaxRetries}) reached.", "Cancelled", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                }
+                else
+                {
+                    MessageBox.Show(
+                        "Migration was cancelled. Progress has been saved and you can resume later.", 
+                        "Cancelled", 
+                        MessageBoxButton.OK, 
+                        MessageBoxImage.Warning);
+                    // Reload checkpoint after cancellation
+                    CheckForExistingCheckpoint();
+                }
             }
             catch (TimeoutException tex)
             {
@@ -307,17 +338,27 @@ namespace FoxProToMySqlMigrator
                 {
                     errorMessage += $"Details: {ex.InnerException.Message}\n\n";
                 }
-                
+
                 errorMessage += $"✅ Your progress has been saved!\n" +
                                $"✅ You can safely close and restart the application\n" +
                                $"✅ Resume migration later from where it stopped\n\n" +
                                $"📁 Check the log files on your Desktop for more details:\n" +
-                               $"   FoxProMySqlMigrator_Logs folder";
-                
-                MessageBox.Show(errorMessage, "Migration Error - Safe to Restart", MessageBoxButton.OK, MessageBoxImage.Error);
-                
-                // Reload checkpoint after error
-                CheckForExistingCheckpoint();
+                               $"   FoxProMySqlMigrator_Logs folder\n\n" +
+                               $"Would you like to retry the migration?";
+
+                var retryResult = MessageBox.Show(errorMessage, "Migration Error - Retry?", MessageBoxButton.YesNo, MessageBoxImage.Error);
+
+                if (retryResult == MessageBoxResult.Yes && _retryCount < MaxRetries)
+                {
+                    _retryCount++;
+                    requestRetryAfterCleanup = true;
+                    checkpointToRetry = await _migrationService.LoadCheckpointAsync(TxtFoxProFolder.Text, TxtDatabaseName.Text);
+                }
+                else
+                {
+                    // Reload checkpoint after error
+                    CheckForExistingCheckpoint();
+                }
             }
             finally
             {
@@ -331,6 +372,14 @@ namespace FoxProToMySqlMigrator
                 BtnStop.Visibility = Visibility.Collapsed;
                 BtnStop.IsEnabled = true;
                 StopSpinner();
+            }
+
+            // If a retry was requested (either by watchdog or user on error), start again after cleanup
+            if (requestRetryAfterCleanup && checkpointToRetry != null)
+            {
+                // Small delay to ensure UI has settled
+                await Task.Delay(1500);
+                await StartMigrationAsync(checkpointToRetry);
             }
         }
 
