@@ -16,6 +16,7 @@ namespace FoxProToMySqlMigrator
         
         // Safe Mode OFF by default - uses exact FoxPro field lengths for accurate migration
         public const bool DefaultSafeMode = false;
-        public const bool DefaultSkipDeletedRecords = true;
+        // By default do NOT skip deleted records (include them in migration)
+        public const bool DefaultSkipDeletedRecords = false;
     }
 }

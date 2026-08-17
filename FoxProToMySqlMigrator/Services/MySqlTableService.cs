@@ -29,22 +29,18 @@ namespace FoxProToMySqlMigrator.Services
             MigrationMode migrationMode,
             CancellationToken cancellationToken = default)
         {
+            // Create table if it does not exist (both FullReload and PatchLoad)
+            var columnDefs = BuildColumnDefinitions(schema, safeMode);
+            var createTableSql = $"CREATE TABLE IF NOT EXISTS `{tableName}` ({string.Join(", ", columnDefs)})";
+            var createCmd = new MySqlCommand(createTableSql, connection);
+            await createCmd.ExecuteNonQueryAsync(cancellationToken);
+
+            // For FullReload mode, do NOT DROP the table. Instead TRUNCATE it to remove existing rows
+            // while keeping the schema intact and avoiding accidental loss of schema-level objects.
             if (migrationMode == MigrationMode.FullReload)
             {
-                // Drop and recreate table
-                var dropCmd = new MySqlCommand($"DROP TABLE IF EXISTS `{tableName}`", connection);
-                await dropCmd.ExecuteNonQueryAsync(cancellationToken);
-
-                await CreateTableInternalAsync(connection, tableName, schema, safeMode, cancellationToken);
-            }
-            else
-            {
-                // Patch Load - create table only if it doesn't exist
-                var columnDefs = BuildColumnDefinitions(schema, safeMode);
-
-                var createTableSql = $"CREATE TABLE IF NOT EXISTS `{tableName}` ({string.Join(", ", columnDefs)})";
-                var createCmd = new MySqlCommand(createTableSql, connection);
-                await createCmd.ExecuteNonQueryAsync(cancellationToken);
+                var truncateCmd = new MySqlCommand($"TRUNCATE TABLE `{tableName}`", connection);
+                await truncateCmd.ExecuteNonQueryAsync(cancellationToken);
             }
         }
 
