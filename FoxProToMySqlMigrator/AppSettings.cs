@@ -1,3 +1,6 @@
+using System.IO;
+using System.Text.Json;
+
 namespace FoxProToMySqlMigrator
 {
     public static class AppSettings
@@ -16,5 +19,56 @@ namespace FoxProToMySqlMigrator
         
         // Safe Mode ON by default - prioritizes preserving rows and avoids string truncation
         public const bool DefaultSafeMode = true;
+
+        public static string AppDataFolder => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FoxProToMySqlMigrator");
+
+        public static string LogsFolder => Path.Combine(AppDataFolder, "Logs");
+
+        public static string ConfigFilePath => Path.Combine(AppDataFolder, "config.json");
+    }
+
+    public sealed class UserAppConfig
+    {
+        public string MySqlServer { get; set; } = AppSettings.DefaultServerConnection;
+        public string TargetDatabase { get; set; } = AppSettings.DefaultDatabaseName;
+        public string FoxProFolder { get; set; } = AppSettings.DefaultFoxProFolder;
+        public int BatchSize { get; set; } = 1000;
+    }
+
+    public static class UserAppConfigStore
+    {
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = true
+        };
+
+        public static UserAppConfig Load()
+        {
+            try
+            {
+                if (!File.Exists(AppSettings.ConfigFilePath))
+                {
+                    return new UserAppConfig();
+                }
+
+                var json = File.ReadAllText(AppSettings.ConfigFilePath);
+                return JsonSerializer.Deserialize<UserAppConfig>(json) ?? new UserAppConfig();
+            }
+            catch
+            {
+                return new UserAppConfig();
+            }
+        }
+
+        public static void Save(UserAppConfig config)
+        {
+            Directory.CreateDirectory(AppSettings.AppDataFolder);
+            Directory.CreateDirectory(AppSettings.LogsFolder);
+
+            var json = JsonSerializer.Serialize(config, JsonOptions);
+            File.WriteAllText(AppSettings.ConfigFilePath, json);
+        }
     }
 }

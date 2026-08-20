@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using System.Windows;
+using System.ComponentModel;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Microsoft.Win32;
@@ -23,6 +26,8 @@ namespace FoxProToMySqlMigrator
         private int _retryCount = 0;
         private const int MaxRetries = 3;
         private bool _shouldRetryRequested = false;
+        private System.Windows.Controls.ListBoxItem? _currentBatchLogItem;
+        private bool _settingsLoaded;
 
         public MainWindow()
         {
@@ -72,11 +77,31 @@ namespace FoxProToMySqlMigrator
 
         private void LoadDefaultSettings()
         {
-            TxtMySqlServer.Text = AppSettings.DefaultServerConnection;
-            TxtDatabaseName.Text = AppSettings.DefaultDatabaseName;
-            TxtFoxProFolder.Text = AppSettings.DefaultFoxProFolder;
-            TxtBatchSize.Text = "1000";
-            ChkSafeMode.IsChecked = AppSettings.DefaultSafeMode;
+            var config = UserAppConfigStore.Load();
+
+            TxtMySqlServer.Text = config.MySqlServer;
+            TxtDatabaseName.Text = config.TargetDatabase;
+            TxtFoxProFolder.Text = config.FoxProFolder;
+            TxtBatchSize.Text = config.BatchSize.ToString();
+            _settingsLoaded = true;
+        }
+
+        private void SaveCurrentSettings()
+        {
+            if (!_settingsLoaded)
+            {
+                return;
+            }
+
+            var config = new UserAppConfig
+            {
+                MySqlServer = TxtMySqlServer.Text,
+                TargetDatabase = TxtDatabaseName.Text,
+                FoxProFolder = TxtFoxProFolder.Text,
+                BatchSize = int.TryParse(TxtBatchSize.Text, out var batchSize) ? batchSize : 1000
+            };
+
+            UserAppConfigStore.Save(config);
         }
 
         private async void CheckForExistingCheckpoint()
@@ -108,12 +133,19 @@ namespace FoxProToMySqlMigrator
 
         private void TxtFoxProFolder_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         {
+            SaveCurrentSettings();
             CheckForExistingCheckpoint();
         }
 
         private void TxtDatabaseName_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         {
+            SaveCurrentSettings();
             CheckForExistingCheckpoint();
+        }
+
+        private void TxtSettings_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        {
+            SaveCurrentSettings();
         }
 
         private void StartSpinner()
@@ -142,6 +174,7 @@ namespace FoxProToMySqlMigrator
             if (dialog.ShowDialog() == true)
             {
                 TxtFoxProFolder.Text = dialog.FolderName;
+                SaveCurrentSettings();
             }
         }
 
@@ -230,11 +263,14 @@ namespace FoxProToMySqlMigrator
                 }
             }
 
+            SaveCurrentSettings();
             await StartMigrationAsync(null);
         }
 
         private async Task StartMigrationAsync(MigrationCheckpoint? resumeFromCheckpoint)
         {
+            SaveCurrentSettings();
+
             bool requestRetryAfterCleanup = false;
             MigrationCheckpoint? checkpointToRetry = null;
             try
@@ -253,9 +289,7 @@ namespace FoxProToMySqlMigrator
                 CheckpointNotification.Visibility = Visibility.Collapsed;
                 StartSpinner();
 
-                var migrationMode = CmbMigrationMode.SelectedIndex == 0 
-                    ? MigrationMode.FullReload 
-                    : MigrationMode.PatchLoad;
+                var migrationMode = MigrationMode.FullReload;
 
                 // Build connection string with database
                 var connectionString = TxtMySqlServer.Text.TrimEnd(';') + $";Database={TxtDatabaseName.Text};";
@@ -267,7 +301,7 @@ namespace FoxProToMySqlMigrator
                     TxtFoxProFolder.Text,
                     connectionString,
                     TxtDatabaseName.Text,
-                    ChkSafeMode.IsChecked ?? false,
+                    true,
                     migrationMode,
                     batchSize,
                     resumeFromCheckpoint,
@@ -321,8 +355,8 @@ namespace FoxProToMySqlMigrator
                                   $"• Reducing batch size (currently {TxtBatchSize.Text})\n" +
                                   $"• Checking database server performance\n" +
                                   $"• Checking network connection\n\n" +
-                                  $"📁 Check the log files on your Desktop for more details:\n" +
-                                  $"   FoxProMySqlMigrator_Logs folder";
+                                  $"📁 Check the log files for more details:\n" +
+                                  $"   {AppSettings.LogsFolder}";
                 
                 MessageBox.Show(errorMessage, "Migration Timeout - Safe to Restart", MessageBoxButton.OK, MessageBoxImage.Error);
                 CheckForExistingCheckpoint();
@@ -340,8 +374,8 @@ namespace FoxProToMySqlMigrator
                 errorMessage += $"✅ Your progress has been saved!\n" +
                                $"✅ You can safely close and restart the application\n" +
                                $"✅ Resume migration later from where it stopped\n\n" +
-                               $"📁 Check the log files on your Desktop for more details:\n" +
-                               $"   FoxProMySqlMigrator_Logs folder\n\n" +
+                               $"📁 Check the log files for more details:\n" +
+                               $"   {AppSettings.LogsFolder}\n\n" +
                                $"Would you like to retry the migration?";
 
                 var retryResult = MessageBox.Show(errorMessage, "Migration Error - Retry?", MessageBoxButton.YesNo, MessageBoxImage.Error);
@@ -405,6 +439,102 @@ namespace FoxProToMySqlMigrator
         {
             LstLog.Items.Clear();
             LstTableSummary.Items.Clear();
+            _currentBatchLogItem = null;
+        }
+
+        private void BtnOpenLogsFolder_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var logsFolder = GetLogsFolder();
+                Directory.CreateDirectory(logsFolder);
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = logsFolder,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Could not open the logs folder.\n\n{ex.Message}",
+                    "Open Logs Folder",
+                    MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            }
+        }
+
+        private void BtnDeleteHistory_Click(object sender, RoutedEventArgs e)
+        {
+            if (_isMigrating)
+            {
+                MessageBox.Show(
+                    "Stop the migration before deleting logs and migration history.",
+                    "Delete Logs & History",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            var result = MessageBox.Show(
+                "Delete all logs and saved migration history?\n\n" +
+                "This removes checkpoints, so the next migration will start clean instead of resuming.",
+                "Delete Logs & History",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (result != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            try
+            {
+                DeleteLogsAndMigrationHistory();
+                _currentCheckpoint = null;
+                CheckpointNotification.Visibility = Visibility.Collapsed;
+                LstLog.Items.Clear();
+                LstTableSummary.Items.Clear();
+                _currentBatchLogItem = null;
+
+                MessageBox.Show(
+                    "Logs and migration history were deleted. The next migration will start clean.",
+                    "Delete Logs & History",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Could not delete logs and migration history.\n\n{ex.Message}",
+                    "Delete Logs & History",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        private static void DeleteLogsAndMigrationHistory()
+        {
+            var logsFolder = Path.GetFullPath(AppSettings.LogsFolder);
+            var appDataFolder = Path.GetFullPath(AppSettings.AppDataFolder);
+
+            if (!logsFolder.StartsWith(appDataFolder, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Refusing to delete a folder outside the app data directory.");
+            }
+
+            if (Directory.Exists(logsFolder))
+            {
+                Directory.Delete(logsFolder, recursive: true);
+            }
+
+            Directory.CreateDirectory(logsFolder);
+        }
+
+        private static string GetLogsFolder()
+        {
+            return AppSettings.LogsFolder;
         }
 
         private void OnLogMessage(string message)
@@ -417,7 +547,25 @@ namespace FoxProToMySqlMigrator
                     Foreground = GetLogMessageBrush(message)
                 };
 
-                LstLog.Items.Add(logItem);
+                if (ShouldUpdateCurrentBatchLog(message))
+                {
+                    if (_currentBatchLogItem == null)
+                    {
+                        _currentBatchLogItem = logItem;
+                        LstLog.Items.Add(_currentBatchLogItem);
+                    }
+                    else
+                    {
+                        _currentBatchLogItem.Content = message;
+                        _currentBatchLogItem.Foreground = logItem.Foreground;
+                    }
+                }
+                else
+                {
+                    _currentBatchLogItem = null;
+                    LstLog.Items.Add(logItem);
+                }
+
                 if (LstLog.Items.Count > 0)
                 {
                     LstLog.ScrollIntoView(LstLog.Items[LstLog.Items.Count - 1]);
@@ -429,24 +577,33 @@ namespace FoxProToMySqlMigrator
             });
         }
 
+        private static bool ShouldUpdateCurrentBatchLog(string message)
+        {
+            return message.Contains("Processing batch #", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("Batch #", StringComparison.OrdinalIgnoreCase) && message.Contains("committed", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("Total progress:", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("Processing final batch #", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("Final batch committed:", StringComparison.OrdinalIgnoreCase);
+        }
+
         private Brush GetLogMessageBrush(string message)
         {
             if (message.Contains("COUNT MATCH", StringComparison.OrdinalIgnoreCase))
             {
-                return Brushes.Green;
+                return new SolidColorBrush(Color.FromRgb(30, 215, 96));
             }
 
             if (message.Contains("COUNT MISMATCH", StringComparison.OrdinalIgnoreCase))
             {
-                return Brushes.Red;
+                return new SolidColorBrush(Color.FromRgb(255, 91, 95));
             }
 
             if (message.Contains("COUNT ACCOUNTED", StringComparison.OrdinalIgnoreCase))
             {
-                return Brushes.Orange;
+                return new SolidColorBrush(Color.FromRgb(255, 200, 87));
             }
 
-            return Brushes.Black;
+            return new SolidColorBrush(Color.FromRgb(231, 231, 231));
         }
 
         private void OnTableCompleted(TableMigrationResult result)
@@ -503,20 +660,26 @@ namespace FoxProToMySqlMigrator
         {
             if (result.CountStatus == "Match")
             {
-                return Brushes.Green;
+                return new SolidColorBrush(Color.FromRgb(30, 215, 96));
             }
 
             if (result.CountStatus == "Mismatch")
             {
-                return Brushes.Red;
+                return new SolidColorBrush(Color.FromRgb(255, 91, 95));
             }
 
             if (result.CountStatus == "Accounted" || result.ErrorCount > 0)
             {
-                return Brushes.Orange;
+                return new SolidColorBrush(Color.FromRgb(255, 200, 87));
             }
 
-            return Brushes.Black;
+            return new SolidColorBrush(Color.FromRgb(231, 231, 231));
+        }
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            SaveCurrentSettings();
+            base.OnClosing(e);
         }
     }
 }

@@ -9,6 +9,8 @@ namespace FoxProToMySqlMigrator
 {
     public class FoxProMigrationService
     {
+        private const long MaxEstimatedBatchBytes = 4L * 1024 * 1024;
+
         public event Action<string>? LogMessage;
         public event Action<TableMigrationResult>? TableCompleted;
         
@@ -57,8 +59,7 @@ namespace FoxProToMySqlMigrator
 
         public async Task<MigrationCheckpoint?> LoadCheckpointAsync(string foxProFolder, string targetDatabase)
         {
-            var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            var checkpointFile = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs", $"checkpoint_{targetDatabase}.json");
+            var checkpointFile = Path.Combine(AppSettings.LogsFolder, $"checkpoint_{targetDatabase}.json");
             
             var checkpointService = new CheckpointService(checkpointFile);
             return await checkpointService.LoadCheckpointAsync(foxProFolder, targetDatabase);
@@ -147,7 +148,7 @@ namespace FoxProToMySqlMigrator
 
                 _logger.Log("Migration completed successfully!");
                 _logger.Log($"===========================================");
-                _logger.Log($"📁 All logs saved to Desktop:");
+                _logger.Log($"📁 All logs saved to:");
                 _logger.Log($"   {mainLogsFolder}");
                 _logger.Log($"===========================================");
             }
@@ -170,11 +171,10 @@ namespace FoxProToMySqlMigrator
 
         private (string mainLogsFolder, string checkpointFilePath) SetupLogFolders(string targetDatabase)
         {
-            var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            var mainLogsFolder = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs", _migrationTimestamp);
+            var mainLogsFolder = Path.Combine(AppSettings.LogsFolder, _migrationTimestamp);
             Directory.CreateDirectory(mainLogsFolder);
             
-            var checkpointFolder = Path.Combine(desktopPath, "FoxProMySqlMigrator_Logs");
+            var checkpointFolder = AppSettings.LogsFolder;
             Directory.CreateDirectory(checkpointFolder);
             var checkpointFilePath = Path.Combine(checkpointFolder, $"checkpoint_{targetDatabase}.json");
             
@@ -324,6 +324,7 @@ namespace FoxProToMySqlMigrator
                         : 0;
 
                     var schema = schemaReader.GetTableSchema(dbfReader, dbfFilePath);
+                    using var memoResolver = DbfMemoResolver.TryCreate(dbfFilePath, schema, Encoding.GetEncoding(1252));
                     
                     LogSchemaInfo(schema, schemaReader, safeMode);
                     
@@ -350,6 +351,7 @@ namespace FoxProToMySqlMigrator
                         batchSize,
                         checkpoint,
                         dbfFilePath,
+                        memoResolver,
                         dbfTotalCount,
                         resumeAfterRecordNumber,
                         cancellationToken);
@@ -762,6 +764,7 @@ namespace FoxProToMySqlMigrator
             int batchSize,
             MigrationCheckpoint checkpoint,
             string dbfFilePath,
+            DbfMemoResolver? memoResolver,
             long? dbfTotalCount,
             long resumeAfterRecordNumber,
             CancellationToken cancellationToken = default)
@@ -784,6 +787,7 @@ namespace FoxProToMySqlMigrator
             MySqlTransaction? transaction = null;
             var batchRows = new List<object?[]>();
             var batchRecordNumbers = new List<long>();
+            long estimatedBatchBytes = 0;
             
             try
             {
@@ -812,7 +816,7 @@ namespace FoxProToMySqlMigrator
                             counters.Deleted++;
                         }
 
-                        var (rowData, repairMessages) = ExtractRowData(dbfReader, schema, isDeleted);
+                        var (rowData, repairMessages) = ExtractRowData(dbfReader, schema, isDeleted, memoResolver, recordNumber);
                         TrackDateColumnStats(counters.DateStats, schema, rowData);
                         if (repairMessages.Count > 0)
                         {
@@ -821,10 +825,11 @@ namespace FoxProToMySqlMigrator
                             recordTracking.LogRepairedRowData(recordNumber, schema, rowData, string.Join(" | ", repairMessages));
                         }
 
+                        estimatedBatchBytes += EstimateRowPayloadBytes(rowData);
                         batchRows.Add(rowData);
                         batchRecordNumbers.Add(recordNumber);
 
-                        if (batchRows.Count >= batchSize)
+                        if (batchRows.Count >= batchSize || estimatedBatchBytes >= MaxEstimatedBatchBytes)
                         {
                     try
                     {
@@ -839,6 +844,7 @@ namespace FoxProToMySqlMigrator
                         await SaveTableProgressCheckpointAsync(checkpoint, tableName, batchRecordNumbers[^1]);
                         batchRows.Clear();
                         batchRecordNumbers.Clear();
+                        estimatedBatchBytes = 0;
                     }
                             catch (Exception batchEx)
                             {
@@ -858,6 +864,7 @@ namespace FoxProToMySqlMigrator
                                 
                                 batchRows.Clear();
                                 batchRecordNumbers.Clear();
+                                estimatedBatchBytes = 0;
                                 throw new Exception($"Batch processing failed at batch #{batchNumber}. This usually indicates a database connection issue or data corruption.", batchEx);
                             }
                         }
@@ -880,6 +887,7 @@ namespace FoxProToMySqlMigrator
                         
                         batchRows.Clear();
                         batchRecordNumbers.Clear();
+                        estimatedBatchBytes = 0;
                     }
                 }
 
@@ -921,7 +929,7 @@ namespace FoxProToMySqlMigrator
                             counters.Deleted++;
                         }
 
-                        var (rowData, repairMessages) = ExtractPhysicalRowData(schema, physicalRecord);
+                        var (rowData, repairMessages) = ExtractPhysicalRowData(schema, physicalRecord, memoResolver);
                         TrackDateColumnStats(counters.DateStats, schema, rowData);
                         if (repairMessages.Count > 0)
                         {
@@ -930,10 +938,11 @@ namespace FoxProToMySqlMigrator
                             recordTracking.LogRepairedRowData(physicalRecord.RecordNumber, schema, rowData, string.Join(" | ", repairMessages));
                         }
 
+                        estimatedBatchBytes += EstimateRowPayloadBytes(rowData);
                         batchRows.Add(rowData);
                         batchRecordNumbers.Add(physicalRecord.RecordNumber);
 
-                        if (batchRows.Count >= batchSize)
+                        if (batchRows.Count >= batchSize || estimatedBatchBytes >= MaxEstimatedBatchBytes)
                         {
                             try
                             {
@@ -948,6 +957,7 @@ namespace FoxProToMySqlMigrator
                                 await SaveTableProgressCheckpointAsync(checkpoint, tableName, batchRecordNumbers[^1]);
                                 batchRows.Clear();
                                 batchRecordNumbers.Clear();
+                                estimatedBatchBytes = 0;
                             }
                             catch (Exception batchEx)
                             {
@@ -967,6 +977,7 @@ namespace FoxProToMySqlMigrator
 
                                 batchRows.Clear();
                                 batchRecordNumbers.Clear();
+                                estimatedBatchBytes = 0;
                                 throw new Exception($"Forced physical DBF read batch failed at batch #{batchNumber}.", batchEx);
                             }
                         }
@@ -1029,9 +1040,36 @@ namespace FoxProToMySqlMigrator
             return counters;
         }
 
+        private long EstimateRowPayloadBytes(object?[] row)
+        {
+            long bytes = 0;
+
+            foreach (var value in row)
+            {
+                bytes += value switch
+                {
+                    null => 4,
+                    DBNull => 4,
+                    string text => Encoding.UTF8.GetByteCount(text),
+                    byte[] binary => binary.Length,
+                    DateTime => 8,
+                    bool => 1,
+                    int => 4,
+                    long => 8,
+                    decimal => 16,
+                    double => 8,
+                    float => 4,
+                    _ => Encoding.UTF8.GetByteCount(value.ToString() ?? "")
+                };
+            }
+
+            return bytes;
+        }
+
         private (object?[] rowData, List<string> repairMessages) ExtractPhysicalRowData(
             List<DbfColumnInfo> schema,
-            DbfPhysicalRecord physicalRecord)
+            DbfPhysicalRecord physicalRecord,
+            DbfMemoResolver? memoResolver)
         {
             var rowData = new object?[schema.Count + 1];
             var repairMessages = new List<string>();
@@ -1039,7 +1077,7 @@ namespace FoxProToMySqlMigrator
             for (var i = 0; i < schema.Count; i++)
             {
                 var value = physicalRecord.Values.Length > i ? physicalRecord.Values[i] : DBNull.Value;
-                rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages);
+                rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, physicalRecord.RecordNumber);
             }
 
             rowData[schema.Count] = physicalRecord.IsDeleted;
@@ -1244,7 +1282,9 @@ namespace FoxProToMySqlMigrator
         private (object?[] rowData, List<string> repairMessages) ExtractRowData(
             DbfDataReader.DbfDataReader dbfReader, 
             List<DbfColumnInfo> schema, 
-            bool isDeleted)
+            bool isDeleted,
+            DbfMemoResolver? memoResolver,
+            long recordNumber)
         {
             var rowData = new object?[schema.Count + 1];
             var repairMessages = new List<string>();
@@ -1255,10 +1295,21 @@ namespace FoxProToMySqlMigrator
                 {
                     var value = dbfReader.GetValue(i);
                     
-                    rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages);
+                    rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, recordNumber);
                 }
                 catch (Exception ex)
                 {
+                    if (schema[i].DbfFieldType == 'M' &&
+                        memoResolver?.TryResolveMemo(schema[i], recordNumber, null, out var resolvedMemo, out var memoRepairMessage) == true)
+                    {
+                        rowData[i] = resolvedMemo;
+                        if (!string.IsNullOrWhiteSpace(memoRepairMessage))
+                        {
+                            repairMessages.Add(memoRepairMessage);
+                        }
+                        continue;
+                    }
+
                     rowData[i] = GetCorruptedFallbackValue(schema[i]);
                     repairMessages.Add($"{schema[i].OriginalName}: read failed, inserted fallback value ({ex.Message})");
                 }
@@ -1268,8 +1319,24 @@ namespace FoxProToMySqlMigrator
             return (rowData, repairMessages);
         }
 
-        private object? NormalizeValueForColumn(DbfColumnInfo column, object? value, List<string> repairMessages)
+        private object? NormalizeValueForColumn(
+            DbfColumnInfo column,
+            object? value,
+            List<string> repairMessages,
+            DbfMemoResolver? memoResolver = null,
+            long recordNumber = 0)
         {
+            if (column.DbfFieldType == 'M' &&
+                memoResolver?.TryResolveMemo(column, recordNumber, value, out var resolvedMemo, out var memoRepairMessage) == true)
+            {
+                if (!string.IsNullOrWhiteSpace(memoRepairMessage))
+                {
+                    repairMessages.Add(memoRepairMessage);
+                }
+
+                return resolvedMemo;
+            }
+
             if (value == null || value == DBNull.Value)
             {
                 return DBNull.Value;
@@ -1292,7 +1359,14 @@ namespace FoxProToMySqlMigrator
 
             if (value is string strValue)
             {
-                return SanitizeStringValue(strValue);
+                var sanitized = SanitizeStringValue(strValue);
+                if (column.DbfFieldType == 'M' && IsLikelyUnresolvedMemoPointer(sanitized))
+                {
+                    repairMessages.Add($"{column.OriginalName}: unresolved memo pointer detected, inserted NULL");
+                    return DBNull.Value;
+                }
+
+                return sanitized;
             }
 
             return value;
@@ -1418,6 +1492,13 @@ namespace FoxProToMySqlMigrator
                 .Replace("\0", "")
                 .Replace("\u001a", "")
                 .TrimEnd();
+        }
+
+        private bool IsLikelyUnresolvedMemoPointer(string value)
+        {
+            var trimmed = value.Trim();
+            return trimmed.Length <= 8 &&
+                   trimmed.Any(c => char.IsControl(c) || c == '\u0081' || c == '\u008D' || c == '\u008F' || c == '\u0090' || c == '\u009D');
         }
 
         private async Task<(MySqlTransaction? transaction, int skippedCount, int failedCount)> ProcessBatch(

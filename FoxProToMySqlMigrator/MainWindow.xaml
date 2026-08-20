@@ -1,43 +1,219 @@
-﻿<Window x:Class="FoxProToMySqlMigrator.MainWindow"
+<Window x:Class="FoxProToMySqlMigrator.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="FoxPro to MySQL Migrator" Height="650" Width="1100">
-    
+        Title="FoxPro to MySQL Migrator"
+        Height="720"
+        Width="1180"
+        MinHeight="600"
+        MinWidth="980"
+        Background="#121212"
+        Foreground="#E7E7E7"
+        FontFamily="Segoe UI">
+
     <Window.Resources>
-        <!-- Spinner Animation -->
+        <SolidColorBrush x:Key="AppBackgroundBrush" Color="#121212"/>
+        <SolidColorBrush x:Key="PanelBrush" Color="#181818"/>
+        <SolidColorBrush x:Key="PanelBorderBrush" Color="#2A2A2A"/>
+        <SolidColorBrush x:Key="PrimaryTextBrush" Color="#F5F5F5"/>
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#A7A7A7"/>
+        <SolidColorBrush x:Key="AccentBrush" Color="#1DB954"/>
+        <SolidColorBrush x:Key="AccentHoverBrush" Color="#1ED760"/>
+        <SolidColorBrush x:Key="DangerBrush" Color="#E5484D"/>
+        <SolidColorBrush x:Key="InputBrush" Color="#242424"/>
+
         <Storyboard x:Key="SpinnerAnimation" RepeatBehavior="Forever">
             <DoubleAnimation Storyboard.TargetName="SpinnerRotation"
-                           Storyboard.TargetProperty="Angle"
-                           From="0" To="360" Duration="0:0:1"/>
+                             Storyboard.TargetProperty="Angle"
+                             From="0" To="360" Duration="0:0:1"/>
         </Storyboard>
+
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+        </Style>
+
+        <Style x:Key="LabelTextStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource SecondaryTextBrush}"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,6"/>
+        </Style>
+
+        <Style x:Key="TipTextStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#7E7E7E"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Margin" Value="0,5,0,0"/>
+        </Style>
+
+        <Style x:Key="SectionTitleStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,10"/>
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="{StaticResource InputBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="BorderBrush" Value="#383838"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6">
+                            <ScrollViewer x:Name="PART_ContentHost"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="{StaticResource InputBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="BorderBrush" Value="#383838"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="MinHeight" Value="32"/>
+        </Style>
+
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="#1F1F1F"/>
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="Padding" Value="10,6"/>
+        </Style>
+
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+
+        <Style x:Key="AppButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#2A2A2A"/>
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="BorderBrush" Value="#3A3A3A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="Padding" Value="13,6"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="16">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Opacity" Value="0.9"/>
+                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#505050"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ButtonBorder" Property="Opacity" Value="0.45"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="PrimaryButtonStyle" TargetType="Button" BasedOn="{StaticResource AppButtonStyle}">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="#07130B"/>
+            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+        </Style>
+
+        <Style x:Key="DangerButtonStyle" TargetType="Button" BasedOn="{StaticResource AppButtonStyle}">
+            <Setter Property="Background" Value="{StaticResource DangerBrush}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="{StaticResource DangerBrush}"/>
+        </Style>
+
+        <Style TargetType="ListBox">
+            <Setter Property="Background" Value="#101010"/>
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource PanelBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="6"/>
+        </Style>
+
+        <Style TargetType="ListBoxItem">
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="Margin" Value="0,1"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#263A2D"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
     </Window.Resources>
-    
-    <Grid Margin="10">
+
+    <Grid Margin="14">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
+        <Grid Grid.Row="0" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
 
-        <!-- Resume Checkpoint Notification -->
-        <Border x:Name="CheckpointNotification" 
-                Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
-                Background="#FFF3CD"
-                BorderBrush="#FFC107"
+            <StackPanel>
+                <TextBlock Text="FoxPro to MySQL Migrator"
+                           FontSize="23"
+                           FontWeight="Bold"/>
+                <TextBlock Text="Move DBF tables into MySQL with checkpoints, repair logs, and table-level status."
+                           Foreground="{StaticResource SecondaryTextBrush}"
+                           FontSize="13"
+                           Margin="0,4,0,0"/>
+            </StackPanel>
+
+            <Border Grid.Column="1"
+                    Background="#16251B"
+                    BorderBrush="#244F32"
+                    BorderThickness="1"
+                    CornerRadius="18"
+                    Padding="14,8"
+                    VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" Margin="0,0,8,0"/>
+                    <TextBlock Text="Ready"
+                               Foreground="{StaticResource AccentHoverBrush}"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <Border x:Name="CheckpointNotification"
+                Grid.Row="1"
+                Background="#2C2414"
+                BorderBrush="#7A5A17"
                 BorderThickness="1"
-                CornerRadius="5"
-                Padding="10"
+                CornerRadius="8"
+                Padding="14"
                 Margin="0,0,0,10"
                 Visibility="Collapsed">
             <Grid>
@@ -46,189 +222,251 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-                
-                <TextBlock Grid.Column="0" 
-                          Text="⚠️ " 
-                          FontSize="16" 
-                          VerticalAlignment="Center"
-                          Margin="0,0,5,0"/>
+
+                <TextBlock Grid.Column="0"
+                           Text="!"
+                           Foreground="#FFC857"
+                           FontSize="18"
+                           FontWeight="Bold"
+                           VerticalAlignment="Center"
+                           Margin="0,0,10,0"/>
                 <TextBlock x:Name="TxtCheckpointMessage"
-                          Grid.Column="1"
-                          TextWrapping="Wrap"
-                          VerticalAlignment="Center"/>
+                           Grid.Column="1"
+                           Foreground="#F7E3AA"
+                           TextWrapping="Wrap"
+                           VerticalAlignment="Center"/>
                 <Button x:Name="BtnResumeCheckpoint"
-                       Grid.Column="2"
-                       Content="Resume Migration"
-                       Padding="10,5"
-                       Background="#28A745"
-                       Foreground="White"
-                       FontWeight="Bold"
-                       Margin="10,0,0,0"
-                       Click="BtnResumeCheckpoint_Click"/>
+                        Grid.Column="2"
+                        Content="Resume Migration"
+                        Style="{StaticResource PrimaryButtonStyle}"
+                        Margin="12,0,0,0"
+                        Click="BtnResumeCheckpoint_Click"/>
             </Grid>
         </Border>
 
-        <!-- FoxPro folder -->
-        <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,0,5,5"
-                   VerticalAlignment="Center" Text="FoxPro folder:"/>
-        <TextBox x:Name="TxtFoxProFolder"
-                 Grid.Row="1" Grid.Column="1" Margin="0,0,5,5"
-                 TextChanged="TxtFoxProFolder_TextChanged"/>
-        <Button Grid.Row="1" Grid.Column="2" Margin="0,0,0,5"
-                Padding="10,2"
-                Content="Browse..."
-                Click="BrowseFolder_Click"/>
-
-        <!-- MySQL connection string -->
-        <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,0,5,5"
-                   VerticalAlignment="Center" Text="MySQL Server:"/>
-        <TextBox x:Name="TxtMySqlServer"
-                 Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
-                 Margin="0,0,0,5"
-                 ToolTip="Example: Server=localhost;User Id=root;Password=yourpass;"/>
-
-        <!-- Database name and Migration Mode -->
-        <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,0,5,5"
-                   VerticalAlignment="Center" Text="Target database:"/>
-        <TextBox x:Name="TxtDatabaseName"
-                 Grid.Row="3" Grid.Column="1" Margin="0,0,5,5"
-                 TextChanged="TxtDatabaseName_TextChanged"/>
-        <ComboBox x:Name="CmbMigrationMode"
-                  Grid.Row="3" Grid.Column="2"
-                  Margin="0,0,0,5"
-                  Width="150"
-                  SelectedIndex="0">
-            <ComboBoxItem Content="Full Reload"/>
-            <ComboBoxItem Content="Patch Load"/>
-        </ComboBox>
-
-        <!-- Batch Size -->
-        <TextBlock Grid.Row="4" Grid.Column="0" Margin="0,0,5,5"
-                   VerticalAlignment="Center" Text="Batch size:"/>
-        <StackPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2"
-                   Orientation="Horizontal" Margin="0,0,0,5">
-            <TextBox x:Name="TxtBatchSize"
-                     Width="100"
-                     Text="1000"
-                     ToolTip="Number of records to commit per batch (recommended: 500-2000)"/>
-            <TextBlock Text=" records per commit" 
-                      VerticalAlignment="Center"
-                      Margin="5,0,0,0"
-                      Foreground="Gray"/>
-        </StackPanel>
-
-        <!-- Options -->
-        <TextBlock Grid.Row="5" Grid.Column="0" Margin="0,0,5,5"
-                   VerticalAlignment="Center" Text="Options:"/>
-        <StackPanel Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="2" 
-                    Orientation="Horizontal" Margin="0,0,0,5">
-            <CheckBox x:Name="ChkSafeMode"
-                      Margin="0,0,15,0"
-                      IsChecked="True"
-                      Content="Safe mode (smart VARCHAR/TEXT)"/>
-        </StackPanel>
-
-        <!-- Separator Line -->
-        <Border Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="3"
-                BorderBrush="LightGray"
-                BorderThickness="0,1,0,0"
-                Margin="0,5,0,10"/>
-
-        <!-- Buttons + Logs -->
-        <Grid Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="3">
+        <Grid Grid.Row="2">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
-            
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="2*"/>
-                <ColumnDefinition Width="5"/>
-                <ColumnDefinition Width="1*"/>
-            </Grid.ColumnDefinitions>
 
-            <!-- Buttons + Spinner -->
-            <StackPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3" 
-                       Orientation="Horizontal" Margin="0,0,0,5">
-                <Button x:Name="BtnMigrate"
-                        Content="Migrate"
-                        Width="100" Margin="0,0,5,0"
-                        Click="BtnMigrate_Click"/>
-                <Button x:Name="BtnStop"
-                        Content="Stop"
-                        Width="100" Margin="0,0,5,0"
-                        Background="#DC3545"
-                        Foreground="White"
-                        Click="BtnStop_Click"
-                        Visibility="Collapsed"/>
-                <Button x:Name="BtnClearLog"
-                        Content="Clear Logs"
-                        Width="100" Margin="0,0,10,0"
-                        Click="BtnClearLog_Click"/>
-                
-                <!-- Loading Spinner -->
-                <StackPanel x:Name="LoadingSpinner"
-                           Orientation="Horizontal"
-                           Visibility="Collapsed"
-                           VerticalAlignment="Center">
-                    <Viewbox Width="20" Height="20" Margin="0,0,8,0">
-                        <Canvas Width="24" Height="24">
-                            <Path Fill="#2196F3"
-                                  Data="M12,4 A8,8 0 0,1 20,12">
-                                <Path.RenderTransform>
-                                    <RotateTransform x:Name="SpinnerRotation" CenterX="12" CenterY="12"/>
-                                </Path.RenderTransform>
-                            </Path>
-                        </Canvas>
-                    </Viewbox>
-                    <TextBlock x:Name="LoadingText"
-                              Text="Migrating..."
-                              Foreground="#2196F3"
-                              FontWeight="Bold"
-                              VerticalAlignment="Center"/>
-                </StackPanel>
-            </StackPanel>
+            <Border Grid.Row="0"
+                    Background="{StaticResource PanelBrush}"
+                    BorderBrush="{StaticResource PanelBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="18"
+                    Margin="0,0,0,10">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="18"/>
+                        <ColumnDefinition Width="190"/>
+                    </Grid.ColumnDefinitions>
 
-            <!-- Left Panel: Detailed Log -->
-            <Grid Grid.Row="1" Grid.Column="0">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                
-                <TextBlock Grid.Row="0"
-                          Text="Migration Log (Detailed)" 
-                          FontWeight="Bold" 
-                          Margin="0,0,0,5"/>
-                <ListBox Grid.Row="1"
-                         x:Name="LstLog" 
-                         ScrollViewer.VerticalScrollBarVisibility="Auto" 
-                         ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
-            </Grid>
+                    <StackPanel Grid.Row="0" Grid.Column="0">
+                        <TextBlock Text="FoxPro folder" Style="{StaticResource LabelTextStyle}"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="TxtFoxProFolder"
+                                     Grid.Column="0"
+                                     TextChanged="TxtFoxProFolder_TextChanged"/>
+                            <Button Grid.Column="2"
+                                    Content="Browse"
+                                    Style="{StaticResource AppButtonStyle}"
+                                    Click="BrowseFolder_Click"/>
+                        </Grid>
+                        <TextBlock Text="Select the folder that contains the .dbf files."
+                                   Style="{StaticResource TipTextStyle}"/>
+                    </StackPanel>
 
-            <!-- Splitter -->
-            <GridSplitter Grid.Row="1" Grid.Column="1" 
-                         Width="5" 
-                         HorizontalAlignment="Stretch" 
-                         VerticalAlignment="Stretch"
-                         Background="LightGray"/>
+                    <StackPanel Grid.Row="0" Grid.RowSpan="3" Grid.Column="2"
+                                VerticalAlignment="Top">
+                        <TextBlock Text="Batch size" Style="{StaticResource LabelTextStyle}"/>
+                            <TextBox x:Name="TxtBatchSize"
+                                     Text="1000"
+                                     TextChanged="TxtSettings_TextChanged"
+                                     ToolTip="Number of records to commit per batch (recommended: 500-2000)"/>
+                        <TextBlock Text="Records saved per commit. Use 500-2000 for most migrations."
+                                   TextWrapping="Wrap"
+                                   Style="{StaticResource TipTextStyle}"/>
+                    </StackPanel>
 
-            <!-- Right Panel: Table Summary -->
-            <Grid Grid.Row="1" Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                
-                <TextBlock Grid.Row="0"
-                          Text="Table Summary" 
-                          FontWeight="Bold" 
-                          Margin="0,0,0,5"/>
-                <ListBox Grid.Row="1"
-                         x:Name="LstTableSummary" 
-                         ScrollViewer.VerticalScrollBarVisibility="Auto"
-                         FontFamily="Consolas"
-                         FontSize="12"/>
+                    <Grid Grid.Row="1" Grid.Column="0" Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="1.4*"/>
+                            <ColumnDefinition Width="12"/>
+                            <ColumnDefinition Width="1*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="MySQL server" Style="{StaticResource LabelTextStyle}"/>
+                            <TextBox x:Name="TxtMySqlServer"
+                                     TextChanged="TxtSettings_TextChanged"
+                                     ToolTip="Example: Server=localhost;User Id=root;Password=yourpass;"/>
+                            <TextBlock Text="Connection string without the database name."
+                                       Style="{StaticResource TipTextStyle}"/>
+                        </StackPanel>
+
+                        <StackPanel Grid.Column="2">
+                            <TextBlock Text="Target database" Style="{StaticResource LabelTextStyle}"/>
+                            <TextBox x:Name="TxtDatabaseName"
+                                     TextChanged="TxtDatabaseName_TextChanged"/>
+                            <TextBlock Text="The MySQL database to create or update."
+                                       Style="{StaticResource TipTextStyle}"/>
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <Border Grid.Row="1"
+                    Background="{StaticResource PanelBrush}"
+                    BorderBrush="{StaticResource PanelBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="14"
+                    Margin="0,0,0,10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+
+                    <Button x:Name="BtnMigrate"
+                            Grid.Column="0"
+                            Content="Migrate"
+                            MinWidth="98"
+                            Style="{StaticResource PrimaryButtonStyle}"
+                            Click="BtnMigrate_Click"/>
+                    <Button x:Name="BtnStop"
+                            Grid.Column="1"
+                            Content="Stop"
+                            MinWidth="86"
+                            Margin="8,0,0,0"
+                            Style="{StaticResource DangerButtonStyle}"
+                            Click="BtnStop_Click"
+                            Visibility="Collapsed"/>
+                    <Button x:Name="BtnClearLog"
+                            Grid.Column="2"
+                            Content="Clear Logs"
+                            MinWidth="96"
+                            Margin="8,0,0,0"
+                            Style="{StaticResource AppButtonStyle}"
+                            Click="BtnClearLog_Click"/>
+
+                    <StackPanel x:Name="LoadingSpinner"
+                                Grid.Column="3"
+                                Orientation="Horizontal"
+                                Visibility="Collapsed"
+                                HorizontalAlignment="Left"
+                                Margin="14,0,0,0"
+                                VerticalAlignment="Center">
+                        <Viewbox Width="22" Height="22" Margin="0,0,8,0">
+                            <Canvas Width="24" Height="24">
+                                <Path Fill="{StaticResource AccentBrush}"
+                                      Data="M12,4 A8,8 0 0,1 20,12">
+                                    <Path.RenderTransform>
+                                        <RotateTransform x:Name="SpinnerRotation" CenterX="12" CenterY="12"/>
+                                    </Path.RenderTransform>
+                                </Path>
+                            </Canvas>
+                        </Viewbox>
+                        <TextBlock x:Name="LoadingText"
+                                   Text="Migrating..."
+                                   Foreground="{StaticResource AccentHoverBrush}"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center"/>
+                    </StackPanel>
+
+                    <Button x:Name="BtnDeleteHistory"
+                            Grid.Column="4"
+                            Content="Delete Logs &amp; History"
+                            MinWidth="156"
+                            Style="{StaticResource DangerButtonStyle}"
+                            Click="BtnDeleteHistory_Click"/>
+                    <Button x:Name="BtnOpenLogsFolder"
+                            Grid.Column="5"
+                            Content="Open Logs Folder"
+                            MinWidth="130"
+                            Margin="8,0,0,0"
+                            Style="{StaticResource AppButtonStyle}"
+                            Click="BtnOpenLogsFolder_Click"/>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="1*"/>
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0"
+                        Background="{StaticResource PanelBrush}"
+                        BorderBrush="{StaticResource PanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8"
+                        Padding="14">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0"
+                                   Text="Migration Log"
+                                   Style="{StaticResource SectionTitleStyle}"/>
+                        <ListBox Grid.Row="1"
+                                 x:Name="LstLog"
+                                 FontFamily="Consolas"
+                                 FontSize="12"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
+                    </Grid>
+                </Border>
+
+                <GridSplitter Grid.Column="1"
+                              Width="8"
+                              HorizontalAlignment="Stretch"
+                              VerticalAlignment="Stretch"
+                              Background="{StaticResource AppBackgroundBrush}"/>
+
+                <Border Grid.Column="2"
+                        Background="{StaticResource PanelBrush}"
+                        BorderBrush="{StaticResource PanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8"
+                        Padding="14">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0"
+                                   Text="Table Summary"
+                                   Style="{StaticResource SectionTitleStyle}"/>
+                        <ListBox Grid.Row="1"
+                                 x:Name="LstTableSummary"
+                                 FontFamily="Consolas"
+                                 FontSize="12"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"/>
+                    </Grid>
+                </Border>
             </Grid>
         </Grid>
     </Grid>

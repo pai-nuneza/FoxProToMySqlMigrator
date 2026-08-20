@@ -139,6 +139,33 @@ namespace FoxProToMySqlMigrator.Services
                             connection, transaction, tableName, columnNames, schema, rows[0], migrationMode, ex, cancellationToken);
                     }
                 }
+                catch (Exception ex) when (rows.Count > 1 && IsBatchSizeError(ex))
+                {
+                    return await ExecuteSplitBatchAsync(
+                        connection,
+                        transaction,
+                        tableName,
+                        columnNames,
+                        schema,
+                        rows,
+                        migrationMode,
+                        cancellationToken);
+                }
+                catch (Exception ex) when (rows.Count == 1 && IsBatchSizeError(ex))
+                {
+                    return new BulkInsertResult
+                    {
+                        FailedRows =
+                        {
+                            new BulkInsertFailedRow
+                            {
+                                Index = 0,
+                                Message = $"Row was too large for the current MySQL packet/memory limit and was skipped safely: {ex.Message}",
+                                Row = rows[0]
+                            }
+                        }
+                    };
+                }
                 catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
                 {
                     throw new TimeoutException($"Bulk insert operation timed out after 10 minutes. This may indicate a database performance issue or network problem.");
@@ -167,6 +194,44 @@ namespace FoxProToMySqlMigrator.Services
             {
                 throw new Exception($"Unexpected error during bulk insert to '{tableName}': {ex.Message}", ex);
             }
+        }
+
+        private async Task<BulkInsertResult> ExecuteSplitBatchAsync(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            string tableName,
+            string columnNames,
+            List<DbfColumnInfo> schema,
+            List<object?[]> rows,
+            MigrationMode migrationMode,
+            CancellationToken cancellationToken)
+        {
+            int mid = rows.Count / 2;
+            var firstHalf = rows.Take(mid).ToList();
+            var secondHalf = rows.Skip(mid).ToList();
+
+            var left = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, firstHalf, migrationMode, cancellationToken);
+            var splitResult = new BulkInsertResult();
+            splitResult.SkippedRows.AddRange(left.SkippedRows);
+            splitResult.RepairedRows.AddRange(left.RepairedRows);
+            splitResult.FailedRows.AddRange(left.FailedRows);
+
+            var right = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, secondHalf, migrationMode, cancellationToken);
+            splitResult.SkippedRows.AddRange(right.SkippedRows.Select(r => (r.Index + mid, r.PrimaryId)));
+            splitResult.RepairedRows.AddRange(right.RepairedRows.Select(r => new BulkInsertRepairEvent
+            {
+                Index = AdjustWarningIndex(r.Index, mid),
+                Message = r.Message,
+                InsertedRow = r.InsertedRow
+            }));
+            splitResult.FailedRows.AddRange(right.FailedRows.Select(r => new BulkInsertFailedRow
+            {
+                Index = r.Index + mid,
+                Message = r.Message,
+                Row = r.Row
+            }));
+
+            return splitResult;
         }
 
         private async Task<BulkInsertResult> TryInsertCorruptedRowAsync(
@@ -235,6 +300,23 @@ namespace FoxProToMySqlMigrator.Services
             }
 
             return exception.InnerException != null && IsConnectionError(exception.InnerException);
+        }
+
+        private bool IsBatchSizeError(Exception exception)
+        {
+            if (exception is OutOfMemoryException)
+            {
+                return true;
+            }
+
+            if (exception is MySqlException mySqlException)
+            {
+                return mySqlException.Number == 1153 ||
+                       mySqlException.Message.Contains("max_allowed_packet", StringComparison.OrdinalIgnoreCase) ||
+                       mySqlException.Message.Contains("packet", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return exception.InnerException != null && IsBatchSizeError(exception.InnerException);
         }
 
         private async Task<List<BulkInsertRepairEvent>> GetWarningsAsync(
