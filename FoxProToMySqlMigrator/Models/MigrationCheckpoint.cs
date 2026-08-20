@@ -9,5 +9,7 @@ namespace FoxProToMySqlMigrator.Models
         public List<string> CompletedTables { get; set; } = new();
         public int TotalTables { get; set; }
         public bool IsCompleted { get; set; }
+        public string? CurrentTable { get; set; }
+        public long CurrentTableLastCommittedRecordNumber { get; set; }
     }
 }

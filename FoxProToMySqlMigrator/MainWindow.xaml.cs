@@ -77,7 +77,6 @@ namespace FoxProToMySqlMigrator
             TxtFoxProFolder.Text = AppSettings.DefaultFoxProFolder;
             TxtBatchSize.Text = "1000";
             ChkSafeMode.IsChecked = AppSettings.DefaultSafeMode;
-            ChkSkipDeleted.IsChecked = AppSettings.DefaultSkipDeletedRecords;
         }
 
         private async void CheckForExistingCheckpoint()
@@ -269,7 +268,6 @@ namespace FoxProToMySqlMigrator
                     connectionString,
                     TxtDatabaseName.Text,
                     ChkSafeMode.IsChecked ?? false,
-                    ChkSkipDeleted.IsChecked ?? true,
                     migrationMode,
                     batchSize,
                     resumeFromCheckpoint,
@@ -413,7 +411,13 @@ namespace FoxProToMySqlMigrator
         {
             Dispatcher.Invoke(() =>
             {
-                LstLog.Items.Add(message);
+                var logItem = new System.Windows.Controls.ListBoxItem
+                {
+                    Content = message,
+                    Foreground = GetLogMessageBrush(message)
+                };
+
+                LstLog.Items.Add(logItem);
                 if (LstLog.Items.Count > 0)
                 {
                     LstLog.ScrollIntoView(LstLog.Items[LstLog.Items.Count - 1]);
@@ -425,15 +429,41 @@ namespace FoxProToMySqlMigrator
             });
         }
 
+        private Brush GetLogMessageBrush(string message)
+        {
+            if (message.Contains("COUNT MATCH", StringComparison.OrdinalIgnoreCase))
+            {
+                return Brushes.Green;
+            }
+
+            if (message.Contains("COUNT MISMATCH", StringComparison.OrdinalIgnoreCase))
+            {
+                return Brushes.Red;
+            }
+
+            if (message.Contains("COUNT ACCOUNTED", StringComparison.OrdinalIgnoreCase))
+            {
+                return Brushes.Orange;
+            }
+
+            return Brushes.Black;
+        }
+
         private void OnTableCompleted(TableMigrationResult result)
         {
             Dispatcher.Invoke(() =>
             {
                 var statusIcon = result.ErrorCount > 0 ? "⚠️" : "✓";
-                var statusColor = result.ErrorCount > 0 ? Brushes.Orange : Brushes.Green;
                 
                 var summaryText = $"{statusIcon} {result.TableName}";
+                
+                if (result.DbfTotalCount.HasValue)
+                    summaryText += $"\n   DBF Total: {result.DbfTotalCount.Value:N0}";
+                else
+                    summaryText += "\n   DBF Total: unknown";
+
                 summaryText += $"\n   Records: {result.RowCount}";
+                summaryText += $"\n   Count: {FormatCountStatus(result)}";
                 
                 if (result.SkippedCount > 0)
                     summaryText += $"\n   Skipped: {result.SkippedCount}";
@@ -446,12 +476,47 @@ namespace FoxProToMySqlMigrator
                 
                 summaryText += "\n";
 
-                LstTableSummary.Items.Add(summaryText);
+                LstTableSummary.Items.Add(new System.Windows.Controls.ListBoxItem
+                {
+                    Content = summaryText,
+                    Foreground = GetTableSummaryBrush(result)
+                });
                 if (LstTableSummary.Items.Count > 0)
                 {
                     LstTableSummary.ScrollIntoView(LstTableSummary.Items[LstTableSummary.Items.Count - 1]);
                 }
             });
+        }
+
+        private string FormatCountStatus(TableMigrationResult result)
+        {
+            return result.CountStatus switch
+            {
+                "Match" => $"MATCH ({result.RowCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
+                "Accounted" => $"ACCOUNTED ({result.AccountedCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
+                "Mismatch" => $"MISMATCH missing {result.MissingCount:N0} ({result.AccountedCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
+                _ => "unknown"
+            };
+        }
+
+        private Brush GetTableSummaryBrush(TableMigrationResult result)
+        {
+            if (result.CountStatus == "Match")
+            {
+                return Brushes.Green;
+            }
+
+            if (result.CountStatus == "Mismatch")
+            {
+                return Brushes.Red;
+            }
+
+            if (result.CountStatus == "Accounted" || result.ErrorCount > 0)
+            {
+                return Brushes.Orange;
+            }
+
+            return Brushes.Black;
         }
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using MySql.Data.MySqlClient;
@@ -9,9 +10,30 @@ using FoxProToMySqlMigrator.Models;
 
 namespace FoxProToMySqlMigrator.Services
 {
+    internal class BulkInsertResult
+    {
+        public List<(int Index, object? PrimaryId)> SkippedRows { get; } = new();
+        public List<BulkInsertRepairEvent> RepairedRows { get; } = new();
+        public List<BulkInsertFailedRow> FailedRows { get; } = new();
+    }
+
+    internal class BulkInsertRepairEvent
+    {
+        public int? Index { get; set; }
+        public string Message { get; set; } = "";
+        public object?[]? InsertedRow { get; set; }
+    }
+
+    internal class BulkInsertFailedRow
+    {
+        public int Index { get; set; }
+        public string Message { get; set; } = "";
+        public object?[] Row { get; set; } = Array.Empty<object?>();
+    }
+
     internal class BulkInsertService
     {
-        public async Task<List<(int Index, object? PrimaryId)>> ExecuteBulkInsertAsync(
+        public async Task<BulkInsertResult> ExecuteBulkInsertAsync(
             MySqlConnection connection,
             MySqlTransaction transaction,
             string tableName,
@@ -21,20 +43,13 @@ namespace FoxProToMySqlMigrator.Services
             MigrationMode migrationMode,
             CancellationToken cancellationToken)
         {
-            if (rows == null || rows.Count == 0) return new List<(int, object?)>();
+            if (rows == null || rows.Count == 0) return new BulkInsertResult();
 
             try
             {
                 var sql = new StringBuilder();
 
-                if (migrationMode == MigrationMode.PatchLoad)
-                {
-                    sql.Append($"INSERT IGNORE INTO `{tableName}` ({columnNames}) VALUES ");
-                }
-                else
-                {
-                    sql.Append($"INSERT INTO `{tableName}` ({columnNames}) VALUES ");
-                }
+                sql.Append($"INSERT INTO `{tableName}` ({columnNames}) VALUES ");
 
                 using var cmd = new MySqlCommand("", connection, transaction);
                 cmd.CommandTimeout = 600; // Increased to 10 minutes for very large batches
@@ -53,7 +68,7 @@ namespace FoxProToMySqlMigrator.Services
 
                         var paramName = $"@p{rowIdx}_{colIdx}";
                         sql.Append(paramName);
-                        cmd.Parameters.AddWithValue(paramName, rows[rowIdx][colIdx] ?? DBNull.Value);
+                        AddTypedParameter(cmd, paramName, rows[rowIdx][colIdx] ?? DBNull.Value);
                     }
 
                     sql.Append(')');
@@ -65,94 +80,63 @@ namespace FoxProToMySqlMigrator.Services
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 
-                var skippedIndices = new List<(int Index, object? PrimaryId)>();
+                var result = new BulkInsertResult();
 
                 try
                 {
-                    var affected = await cmd.ExecuteNonQueryAsync(linkedCts.Token);
-
-                    // If using PATCH load mode with INSERT IGNORE some rows may be ignored (e.g. duplicates)
-                    if (migrationMode == MigrationMode.PatchLoad && affected < rows.Count)
-                    {
-                        // Determine which rows were skipped by checking for an existing matching row in the target table.
-                        for (int r = 0; r < rows.Count; r++)
-                        {
-                            var whereClause = new StringBuilder();
-                            using var existsCmd = new MySqlCommand();
-                            existsCmd.Connection = connection;
-                            existsCmd.Transaction = transaction;
-
-                            var predicates = new List<string>();
-                            for (int c = 0; c < schema.Count; c++)
-                            {
-                                var colName = schema[c].Name;
-                                var paramName = $"@e{r}_{c}";
-                                predicates.Add($"((`{colName}` IS NULL AND {paramName} IS NULL) OR (`{colName}` = {paramName}))");
-                                existsCmd.Parameters.AddWithValue(paramName, rows[r][c] ?? DBNull.Value);
-                            }
-                            whereClause.Append(string.Join(" AND ", predicates));
-
-                            // Try to fetch the primary_id if present, otherwise fall back to a simple existence check
-                            try
-                            {
-                                existsCmd.CommandText = $"SELECT `primary_id` FROM `{tableName}` WHERE {whereClause}";
-                                var scalar = await existsCmd.ExecuteScalarAsync(cancellationToken);
-                                if (scalar != null)
-                                {
-                                    skippedIndices.Add((r, scalar));
-                                    continue;
-                                }
-                            }
-                            catch (MySqlException mex) when (mex.Number == 1054)
-                            {
-                                // unknown column `primary_id` - fall back to SELECT 1
-                                try
-                                {
-                                    existsCmd.CommandText = $"SELECT 1 FROM `{tableName}` WHERE {whereClause}";
-                                    var scalar2 = await existsCmd.ExecuteScalarAsync(cancellationToken);
-                                    if (scalar2 != null)
-                                    {
-                                        skippedIndices.Add((r, null));
-                                        continue;
-                                    }
-                                }
-                                catch
-                                {
-                                    skippedIndices.Add((r, null));
-                                }
-                            }
-                            catch
-                            {
-                                // Any other error - conservatively mark skipped with unknown primary id
-                                skippedIndices.Add((r, null));
-                            }
-                        }
-                    }
+                    await cmd.ExecuteNonQueryAsync(linkedCts.Token);
+                    result.RepairedRows.AddRange(await GetWarningsAsync(connection, transaction, cancellationToken));
                 }
                 catch (MySqlException ex)
                 {
                     // If a large batch failed, try to split and retry smaller batches to identify problematic rows
+                    if (IsConnectionError(ex))
+                    {
+                        throw;
+                    }
+
+                    if (migrationMode == MigrationMode.PatchLoad && ex.Number == 1062 && rows.Count == 1)
+                    {
+                        return new BulkInsertResult
+                        {
+                            SkippedRows = { (0, null) }
+                        };
+                    }
+
                     if (rows.Count > 1)
                     {
                         int mid = rows.Count / 2;
                         var firstHalf = rows.Take(mid).ToList();
                         var secondHalf = rows.Skip(mid).ToList();
 
-                        var resultList = new List<(int Index, object? PrimaryId)>();
                         var left = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, firstHalf, migrationMode, cancellationToken);
-                        resultList.AddRange(left);
+                        var splitResult = new BulkInsertResult();
+                        splitResult.SkippedRows.AddRange(left.SkippedRows);
+                        splitResult.RepairedRows.AddRange(left.RepairedRows);
+                        splitResult.FailedRows.AddRange(left.FailedRows);
 
                         var right = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, secondHalf, migrationMode, cancellationToken);
                         // adjust indices for the second half
-                        resultList.AddRange(right.Select(r => (r.Index + mid, r.PrimaryId)));
+                        splitResult.SkippedRows.AddRange(right.SkippedRows.Select(r => (r.Index + mid, r.PrimaryId)));
+                        splitResult.RepairedRows.AddRange(right.RepairedRows.Select(r => new BulkInsertRepairEvent
+                        {
+                            Index = AdjustWarningIndex(r.Index, mid),
+                            Message = r.Message,
+                            InsertedRow = r.InsertedRow
+                        }));
+                        splitResult.FailedRows.AddRange(right.FailedRows.Select(r => new BulkInsertFailedRow
+                        {
+                            Index = r.Index + mid,
+                            Message = r.Message,
+                            Row = r.Row
+                        }));
 
-                        return resultList;
+                        return splitResult;
                     }
                     else
                     {
-                        // Single row failed - include row details for diagnostics
-                        string rowContent = FormatRowForLog(rows[0], schema);
-                        throw new Exception($"Bulk insert failed for a single row. MySQL error #{ex.Number}: {ex.Message}. Row: {rowContent}", ex);
+                        return await TryInsertCorruptedRowAsync(
+                            connection, transaction, tableName, columnNames, schema, rows[0], migrationMode, ex, cancellationToken);
                     }
                 }
                 catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
@@ -160,14 +144,16 @@ namespace FoxProToMySqlMigrator.Services
                     throw new TimeoutException($"Bulk insert operation timed out after 10 minutes. This may indicate a database performance issue or network problem.");
                 }
 
-                return skippedIndices;
+                return result;
             }
             catch (MySqlException ex)
             {
                 // Provide more specific error messages for common MySQL errors
                 var errorMessage = ex.Number switch
                 {
-                    1062 => "Duplicate entry found (key constraint violation)",
+                    1062 => migrationMode == MigrationMode.PatchLoad
+                        ? "Duplicate entry found while isolating a patch-load row"
+                        : "Duplicate entry found (key constraint violation)",
                     1406 => $"Data too long for a column in table '{tableName}'",
                     1054 => $"Unknown column in table '{tableName}'",
                     2013 => "Lost connection to MySQL server during query",
@@ -183,6 +169,119 @@ namespace FoxProToMySqlMigrator.Services
             }
         }
 
+        private async Task<BulkInsertResult> TryInsertCorruptedRowAsync(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            string tableName,
+            string columnNames,
+            List<DbfColumnInfo> schema,
+            object?[] row,
+            MigrationMode migrationMode,
+            MySqlException originalException,
+            CancellationToken cancellationToken)
+        {
+            var result = new BulkInsertResult();
+            if (migrationMode == MigrationMode.PatchLoad && originalException.Number == 1062)
+            {
+                result.SkippedRows.Add((0, null));
+                return await Task.FromResult(result);
+            }
+
+            result.FailedRows.Add(new BulkInsertFailedRow
+            {
+                Index = 0,
+                Message = $"Row could not be inserted safely. MySQL error #{originalException.Number}: {originalException.Message}. Source values were preserved in the failed-row log.",
+                Row = row
+            });
+            return await Task.FromResult(result);
+        }
+
+        private void AddTypedParameter(MySqlCommand command, string parameterName, object? value)
+        {
+            if (value == null || value == DBNull.Value)
+            {
+                command.Parameters.AddWithValue(parameterName, DBNull.Value);
+                return;
+            }
+
+            if (value is string stringValue)
+            {
+                var parameter = command.Parameters.Add(parameterName, MySqlDbType.LongText);
+                parameter.Value = stringValue;
+                return;
+            }
+
+            if (value is byte[] bytes)
+            {
+                var parameter = command.Parameters.Add(parameterName, MySqlDbType.LongBlob);
+                parameter.Value = bytes;
+                return;
+            }
+
+            command.Parameters.AddWithValue(parameterName, value);
+        }
+
+        private bool IsConnectionError(Exception exception)
+        {
+            if (exception is MySqlException mySqlException)
+            {
+                return mySqlException.Number == 0
+                    || mySqlException.Number == 1042
+                    || mySqlException.Number == 1047
+                    || mySqlException.Number == 2002
+                    || mySqlException.Number == 2003
+                    || mySqlException.Number == 2006
+                    || mySqlException.Number == 2013;
+            }
+
+            return exception.InnerException != null && IsConnectionError(exception.InnerException);
+        }
+
+        private async Task<List<BulkInsertRepairEvent>> GetWarningsAsync(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            CancellationToken cancellationToken)
+        {
+            var warnings = new List<BulkInsertRepairEvent>();
+
+            using var warningCmd = new MySqlCommand("SHOW WARNINGS", connection, transaction);
+            using var reader = await warningCmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var level = reader.GetString(0);
+                var code = reader.GetInt32(1);
+                var message = reader.GetString(2);
+                if (code == 1062)
+                {
+                    continue;
+                }
+
+                warnings.Add(new BulkInsertRepairEvent
+                {
+                    Index = TryGetZeroBasedRowIndex(message),
+                    Message = $"{level} {code}: {message}"
+                });
+            }
+
+            return warnings;
+        }
+
+        private int? TryGetZeroBasedRowIndex(string warningMessage)
+        {
+            var match = Regex.Match(warningMessage, @"at row (?<row>\d+)", RegexOptions.IgnoreCase);
+            if (!match.Success || !int.TryParse(match.Groups["row"].Value, out var oneBasedRow))
+            {
+                return null;
+            }
+
+            return Math.Max(0, oneBasedRow - 1);
+        }
+
+        private int? AdjustWarningIndex(int? index, int offset)
+        {
+            return index.HasValue ? index.Value + offset : null;
+        }
+
         private string FormatRowForLog(object?[] row, List<DbfColumnInfo> schema)
         {
             try
@@ -191,7 +290,7 @@ namespace FoxProToMySqlMigrator.Services
                 for (int i = 0; i < Math.Min(schema.Count, row.Length); i++)
                 {
                     var name = schema[i].Name;
-                    var val = row[i] == null || row[i] == DBNull.Value ? "NULL" : row[i].ToString();
+                    var val = row[i] == null || row[i] == DBNull.Value ? "NULL" : row[i]?.ToString() ?? "";
                     sb.AppendFormat("{0}={1}; ", name, val);
                 }
                 return sb.ToString();

@@ -27,6 +27,7 @@ namespace FoxProToMySqlMigrator.Services
             List<DbfColumnInfo> schema, 
             bool safeMode,
             MigrationMode migrationMode,
+            bool preserveExistingRows = false,
             CancellationToken cancellationToken = default)
         {
             // Create table if it does not exist (both FullReload and PatchLoad)
@@ -35,12 +36,65 @@ namespace FoxProToMySqlMigrator.Services
             var createCmd = new MySqlCommand(createTableSql, connection);
             await createCmd.ExecuteNonQueryAsync(cancellationToken);
 
+            await WidenTextColumnsAsync(connection, tableName, schema, cancellationToken);
+
             // For FullReload mode, do NOT DROP the table. Instead TRUNCATE it to remove existing rows
             // while keeping the schema intact and avoiding accidental loss of schema-level objects.
-            if (migrationMode == MigrationMode.FullReload)
+            if (migrationMode == MigrationMode.FullReload && !preserveExistingRows)
             {
                 var truncateCmd = new MySqlCommand($"TRUNCATE TABLE `{tableName}`", connection);
                 await truncateCmd.ExecuteNonQueryAsync(cancellationToken);
+                await SynchronizeColumnTypesAsync(connection, tableName, schema, safeMode, cancellationToken);
+            }
+        }
+
+        private async Task WidenTextColumnsAsync(
+            MySqlConnection connection,
+            string tableName,
+            List<DbfColumnInfo> schema,
+            CancellationToken cancellationToken)
+        {
+            foreach (var column in schema.Where(IsTextColumn))
+            {
+                var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` LONGTEXT", connection);
+                await alterCmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            foreach (var column in schema.Where(IsBinaryColumn))
+            {
+                var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` LONGBLOB", connection);
+                await alterCmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+        }
+
+        private bool IsTextColumn(DbfColumnInfo column)
+        {
+            return column.DbfFieldType == 'C'
+                || column.DbfFieldType == 'M'
+                || column.DbfFieldType == 'V'
+                || column.ColumnType == typeof(string);
+        }
+
+        private bool IsBinaryColumn(DbfColumnInfo column)
+        {
+            return column.DbfFieldType == 'G'
+                || column.DbfFieldType == 'Q'
+                || column.DbfFieldType == 'W'
+                || column.ColumnType == typeof(byte[]);
+        }
+
+        private async Task SynchronizeColumnTypesAsync(
+            MySqlConnection connection,
+            string tableName,
+            List<DbfColumnInfo> schema,
+            bool safeMode,
+            CancellationToken cancellationToken)
+        {
+            foreach (var column in schema)
+            {
+                var mySqlType = _typeMapper.MapToMySqlType(column, safeMode);
+                var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` {mySqlType}", connection);
+                await alterCmd.ExecuteNonQueryAsync(cancellationToken);
             }
         }
 

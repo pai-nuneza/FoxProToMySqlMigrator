@@ -15,9 +15,12 @@ namespace FoxProToMySqlMigrator.Services
             "address"  // Added address to large text fields
         };
 
-        public List<DbfColumnInfo> GetTableSchema(DbfDataReader.DbfDataReader reader)
+        public List<DbfColumnInfo> GetTableSchema(DbfDataReader.DbfDataReader reader, string? dbfFilePath = null)
         {
             var columns = new List<DbfColumnInfo>();
+            var headerFields = string.IsNullOrWhiteSpace(dbfFilePath)
+                ? new List<DbfHeaderFieldInfo>()
+                : ReadHeaderFieldInfo(dbfFilePath);
             
             // Access the DbfTable property using reflection to get field metadata
             var dbfTableProperty = reader.GetType().GetProperty("DbfTable", 
@@ -88,6 +91,17 @@ namespace FoxProToMySqlMigrator.Services
                     }
                 }
                 
+                var headerField = i < headerFields.Count
+                    ? headerFields[i]
+                    : headerFields.FirstOrDefault(f => string.Equals(f.Name, columnName, StringComparison.OrdinalIgnoreCase));
+
+                if (headerField != null)
+                {
+                    dbfFieldType = headerField.Type;
+                    length = headerField.Length;
+                    decimalCount = headerField.DecimalCount;
+                }
+
                 columns.Add(new DbfColumnInfo
                 {
                     Name = columnName.ToLower(),
@@ -101,6 +115,65 @@ namespace FoxProToMySqlMigrator.Services
             }
 
             return columns;
+        }
+
+        private sealed class DbfHeaderFieldInfo
+        {
+            public string Name { get; init; } = "";
+            public char Type { get; init; }
+            public int Length { get; init; }
+            public int DecimalCount { get; init; }
+        }
+
+        private List<DbfHeaderFieldInfo> ReadHeaderFieldInfo(string dbfFilePath)
+        {
+            var fields = new List<DbfHeaderFieldInfo>();
+
+            try
+            {
+                using var stream = new FileStream(dbfFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                if (stream.Length < 33)
+                {
+                    return fields;
+                }
+
+                var header = new byte[32];
+                _ = stream.Read(header, 0, header.Length);
+                var headerLength = BitConverter.ToUInt16(header, 8);
+
+                stream.Position = 32;
+                while (stream.Position + 32 <= stream.Length && stream.Position < headerLength)
+                {
+                    var descriptor = new byte[32];
+                    var bytesRead = stream.Read(descriptor, 0, descriptor.Length);
+                    if (bytesRead < descriptor.Length || descriptor[0] == 0x0D)
+                    {
+                        break;
+                    }
+
+                    var nullNameIndex = Array.IndexOf(descriptor, (byte)0x00, 0, 11);
+                    var nameLength = nullNameIndex >= 0 ? nullNameIndex : 11;
+                    var fieldName = Encoding.ASCII.GetString(descriptor, 0, nameLength).Trim();
+                    if (string.IsNullOrWhiteSpace(fieldName))
+                    {
+                        continue;
+                    }
+
+                    fields.Add(new DbfHeaderFieldInfo
+                    {
+                        Name = fieldName,
+                        Type = (char)descriptor[11],
+                        Length = descriptor[16],
+                        DecimalCount = descriptor[17]
+                    });
+                }
+            }
+            catch
+            {
+                return fields;
+            }
+
+            return fields;
         }
 
         public (DbfDataReader.DbfDataReader reader, FileStream? memoStream) OpenDbfFile(
@@ -128,7 +201,8 @@ namespace FoxProToMySqlMigrator.Services
             
             var options = new DbfDataReaderOptions
             {
-                Encoding = Encoding.GetEncoding(1252)
+                Encoding = Encoding.GetEncoding(1252),
+                SkipDeletedRecords = false
             };
 
             var dbfStream = new FileStream(dbfFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);

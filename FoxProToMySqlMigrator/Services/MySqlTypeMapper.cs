@@ -41,15 +41,23 @@ namespace FoxProToMySqlMigrator.Services
                     return "BOOLEAN";
                 
                 case 'I': // Integer field
-                    return "INT";
+                case '+': // Auto-increment integer field
+                    return safeMode ? "DECIMAL(20,0)" : "INT";
                 
                 case 'N': // Numeric field - could be integer or decimal
+                    int numericLength = Math.Clamp(column.Length > 0 ? column.Length : 19, 1, 65);
+                    int numericScale = Math.Clamp(column.DecimalCount, 0, numericLength);
+
+                    if (safeMode)
+                    {
+                        return $"DECIMAL({numericLength},{numericScale})";
+                    }
+
                     if (column.DecimalCount > 0)
                     {
                         // Has decimal places - use a generous DECIMAL to avoid overflow/truncation
                         // Use a safe precision (total digits) while keeping the original scale (decimal places)
-                        int precision = Math.Max(column.Length, 19);
-                        precision = Math.Min(precision, 65); // DECIMAL max precision in MySQL
+                        int precision = Math.Max(numericLength, 19);
                         return $"DECIMAL({precision},{column.DecimalCount})";
                     }
                     else if (column.Length <= 10)
@@ -65,6 +73,7 @@ namespace FoxProToMySqlMigrator.Services
                 
                 case 'F': // Float field
                 case 'B': // Double field
+                case 'O': // Double field
                     return "DOUBLE";
                 
                 case 'Y': // Currency field
@@ -74,43 +83,15 @@ namespace FoxProToMySqlMigrator.Services
                     return "LONGTEXT";
                 
                 case 'G': // General/Binary field
-                    return "BLOB";
+                case 'Q': // Varbinary
+                case 'W': // Blob
+                    return "LONGBLOB";
                 
                 case 'C': // Character field
+                case 'V': // Varchar/varbinary-like text in Visual FoxPro
                 default:  // Default to character handling
-                    // Check if this is a memo-like field
-                    if (IsLargeTextField(column))
-                    {
-                        return "LONGTEXT";
-                    }
-                    
-                    // Use the actual DBF field length from FoxPro
-                    int fieldLength = column.Length > 0 ? column.Length : 255;
-                    
-                    if (safeMode)
-                    {
-                        // Safe mode: Add buffer to prevent truncation (20% extra or min +50)
-                        int safeLength = Math.Max(fieldLength + 50, (int)(fieldLength * 1.2));
-                        
-                        // Cap at 65535 (TEXT range), use TEXT if exceeds VARCHAR max
-                        if (safeLength > 65535)
-                        {
-                            return "LONGTEXT";
-                        }
-                        
-                        return $"VARCHAR({safeLength})";
-                    }
-                    else
-                    {
-                        // Safe mode OFF - use exact FoxPro field length
-                        // Cap at 65535 (VARCHAR max in MySQL)
-                        if (fieldLength > 65535)
-                        {
-                            return "LONGTEXT";
-                        }
-                        
-                        return $"VARCHAR({fieldLength})";
-                    }
+                    // Data integrity wins over compact schema. LONGTEXT is MySQL's largest text type.
+                    return "LONGTEXT";
             }
         }
 

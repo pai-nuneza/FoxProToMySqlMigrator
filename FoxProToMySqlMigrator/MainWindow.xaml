@@ -126,9 +126,6 @@
                       Margin="0,0,15,0"
                       IsChecked="True"
                       Content="Safe mode (smart VARCHAR/TEXT)"/>
-            <CheckBox x:Name="ChkSkipDeleted"
-                      IsChecked="True"
-                      Content="Don't include deleted records"/>
         </StackPanel>
 
         <!-- Separator Line -->

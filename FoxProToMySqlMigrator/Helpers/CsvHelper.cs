@@ -21,7 +21,7 @@ namespace FoxProToMySqlMigrator.Helpers
 
         public static void WriteErrorRecord(
             StreamWriter writer,
-            int recordNumber,
+            long recordNumber,
             List<(string columnName, string value)> columnData,
             string errorMessage)
         {
@@ -33,7 +33,7 @@ namespace FoxProToMySqlMigrator.Helpers
 
         public static void WriteSkippedRecord(
             StreamWriter writer,
-            int recordNumber,
+            long recordNumber,
             List<(string columnName, string value)> columnData,
             string reason)
         {
