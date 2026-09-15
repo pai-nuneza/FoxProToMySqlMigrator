@@ -7,6 +7,7 @@ namespace FoxProToMySqlMigrator.Models
         public DateTime StartTime { get; set; }
         public DateTime LastUpdateTime { get; set; }
         public List<string> CompletedTables { get; set; } = new();
+        public List<string> FailedTables { get; set; } = new();
         public int TotalTables { get; set; }
         public bool IsCompleted { get; set; }
         public string? CurrentTable { get; set; }

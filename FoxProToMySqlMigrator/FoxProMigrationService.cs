@@ -1,4 +1,5 @@
 ﻿using System.IO;
+using System.Globalization;
 using System.Text;
 using MySql.Data.MySqlClient;
 using FoxProToMySqlMigrator.Models;
@@ -18,6 +19,8 @@ namespace FoxProToMySqlMigrator
         private string _errorRecordsFolder = "";
         private string _skippedRecordsFolder = "";
         private string _repairedRecordsFolder = "";
+        private string _failedTablesLogPath = "";
+        private string _tableStatusLogPath = "";
         private string _migrationTimestamp = "";
         private CheckpointService? _checkpointService;
         
@@ -50,11 +53,31 @@ namespace FoxProToMySqlMigrator
             public long Failed { get; set; }
             public long ConversionWarnings { get; set; }
             public long ResumeSkipped { get; set; }
+            public long PhysicalRecovered { get; set; }
+            public long PhysicalEofMarkers { get; set; }
+            public long PhysicalUnexpectedMarkers { get; set; }
+            public long ReaderFailuresRecovered { get; set; }
             public List<DateColumnMigrationStats> DateStats { get; set; } = new();
 
             public long Accounted => Read + ResumeSkipped;
             public long RowCount => Inserted + Updated;
-            public long ErrorCount => Failed + ConversionWarnings;
+            public long ErrorCount => Failed;
+            public long WarningCount => ConversionWarnings;
+        }
+
+        private sealed class CountSummary
+        {
+            public string Status { get; init; } = "Unknown";
+            public long AccountedCount { get; init; }
+            public long MissingCount { get; init; }
+            public string Explanation { get; init; } = "";
+        }
+
+        private sealed class PhysicalCopyResult
+        {
+            public MySqlTransaction? Transaction { get; init; }
+            public int BatchNumber { get; init; }
+            public long EstimatedBatchBytes { get; init; }
         }
 
         public async Task<MigrationCheckpoint?> LoadCheckpointAsync(string foxProFolder, string targetDatabase)
@@ -112,6 +135,7 @@ namespace FoxProToMySqlMigrator
                     LastUpdateTime = DateTime.Now,
                     TotalTables = dbfFiles.Length,
                     CompletedTables = new List<string>(),
+                    FailedTables = new List<string>(),
                     IsCompleted = false
                 };
 
@@ -144,9 +168,18 @@ namespace FoxProToMySqlMigrator
                 // Mark as completed
                 checkpoint.IsCompleted = true;
                 await _checkpointService.SaveCheckpointAsync(checkpoint);
-                _checkpointService.DeleteCheckpoint();
+                _logger.Log($"Checkpoint preserved at: {checkpointFilePath}");
 
-                _logger.Log("Migration completed successfully!");
+                if (checkpoint.FailedTables.Count > 0)
+                {
+                    _logger.Log($"Migration finished after attempting all tables. Completed={checkpoint.CompletedTables.Count:N0}, Failed/Skipped={checkpoint.FailedTables.Count:N0}, Total={checkpoint.TotalTables:N0}.");
+                    _logger.Log($"Migration completed with {checkpoint.FailedTables.Count:N0} failed table(s). See migration_errors.txt and failed_tables.txt for details.");
+                    _logger.Log($"Failed tables: {string.Join(", ", checkpoint.FailedTables)}");
+                }
+                else
+                {
+                    _logger.Log($"Migration completed successfully! Completed={checkpoint.CompletedTables.Count:N0}, Failed/Skipped=0, Total={checkpoint.TotalTables:N0}.");
+                }
                 _logger.Log($"===========================================");
                 _logger.Log($"📁 All logs saved to:");
                 _logger.Log($"   {mainLogsFolder}");
@@ -186,6 +219,20 @@ namespace FoxProToMySqlMigrator
 
             _repairedRecordsFolder = Path.Combine(mainLogsFolder, "RepairedRecords");
             Directory.CreateDirectory(_repairedRecordsFolder);
+
+            _failedTablesLogPath = Path.Combine(mainLogsFolder, "failed_tables.txt");
+            File.WriteAllText(
+                _failedTablesLogPath,
+                $"Failed/skipped table summary for migration {_migrationTimestamp}{Environment.NewLine}" +
+                $"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}" +
+                $"========================================{Environment.NewLine}{Environment.NewLine}");
+
+            _tableStatusLogPath = Path.Combine(mainLogsFolder, "table_status.txt");
+            File.WriteAllText(
+                _tableStatusLogPath,
+                $"Table migration status for migration {_migrationTimestamp}{Environment.NewLine}" +
+                $"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}" +
+                $"========================================{Environment.NewLine}{Environment.NewLine}");
 
             return (mainLogsFolder, checkpointFilePath);
         }
@@ -253,29 +300,61 @@ namespace FoxProToMySqlMigrator
         {
             var totalTables = dbfFiles.Length;
             var currentTable = 0;
+            checkpoint.CompletedTables ??= new List<string>();
+            checkpoint.FailedTables ??= new List<string>();
+            var tableService = new MySqlTableService();
 
             foreach (var dbfFile in dbfFiles)
             {
-                var tableName = Path.GetFileNameWithoutExtension(dbfFile);
+                var tableName = Path.GetFileNameWithoutExtension(dbfFile).ToLower();
                 
                 // Skip already completed tables
-                if (checkpoint.CompletedTables.Contains(tableName))
+                if (ContainsTable(checkpoint.CompletedTables, tableName))
                 {
                     currentTable++;
                     _logger!.Log($"[{currentTable}/{totalTables}] ⏭️  Skipping already completed table: {tableName}");
+                    LogTableStatus(tableName, "SKIPPED_COMPLETED", dbfFile, "Already completed in checkpoint.");
+                    continue;
+                }
+
+                if (ContainsTable(checkpoint.FailedTables, tableName))
+                {
+                    currentTable++;
+                    _logger!.Log($"[{currentTable}/{totalTables}] ⏭️  Skipping previously failed table: {tableName}. See migration_errors.txt for the saved failure details.");
+                    LogTableStatus(tableName, "SKIPPED_FAILED", dbfFile, "Previously failed in checkpoint.");
                     continue;
                 }
 
                 cancellationToken.ThrowIfCancellationRequested();
 
                 currentTable++;
-                _logger!.Log($"[{currentTable}/{totalTables}] Processing table: {tableName}");
+                var wasResumingThisTable = string.Equals(checkpoint.CurrentTable, tableName, StringComparison.OrdinalIgnoreCase)
+                    && checkpoint.CurrentTableLastCommittedRecordNumber > 0;
+
+                if (!wasResumingThisTable && await tableService.TableExistsAsync(mySqlConn, tableName, cancellationToken))
+                {
+                    _logger!.Log($"[{currentTable}/{totalTables}] ⏭️  Skipping existing MySQL table: {tableName}");
+                    LogTableStatus(tableName, "SKIPPED_EXISTING", dbfFile, "MySQL table already exists.");
+                    AddTableIfMissing(checkpoint.CompletedTables, tableName);
+                    checkpoint.CurrentTable = null;
+                    checkpoint.CurrentTableLastCommittedRecordNumber = 0;
+                    checkpoint.LastUpdateTime = DateTime.Now;
+                    await _checkpointService!.SaveCheckpointAsync(checkpoint);
+
+                    TableCompleted?.Invoke(new TableMigrationResult
+                    {
+                        TableName = tableName,
+                        CountStatus = "SkippedExisting"
+                    });
+                    continue;
+                }
+
+                _logger!.Log($"[{currentTable}/{totalTables}] START table `{tableName}`");
                 
                 // Reset reflection cache for each table
                 _cachedDbfRecordProperty = null;
                 _cachedIsDeletedProperty = null;
                 
-                var wasResumingThisTable = string.Equals(checkpoint.CurrentTable, tableName, StringComparison.OrdinalIgnoreCase);
                 checkpoint.CurrentTable = tableName;
                 checkpoint.CurrentTableLastCommittedRecordNumber = wasResumingThisTable
                     ? checkpoint.CurrentTableLastCommittedRecordNumber
@@ -283,14 +362,99 @@ namespace FoxProToMySqlMigrator
                 checkpoint.LastUpdateTime = DateTime.Now;
                 await _checkpointService!.SaveCheckpointAsync(checkpoint);
 
-                await MigrateTableAsync(dbfFile, mySqlConn, checkpoint, safeMode, migrationMode, batchSize, cancellationToken);
-                
-                // Update checkpoint after successful table migration
-                checkpoint.CompletedTables.Add(tableName);
-                checkpoint.CurrentTable = null;
-                checkpoint.CurrentTableLastCommittedRecordNumber = 0;
-                checkpoint.LastUpdateTime = DateTime.Now;
-                await _checkpointService!.SaveCheckpointAsync(checkpoint);
+                try
+                {
+                    await MigrateTableAsync(dbfFile, mySqlConn, checkpoint, safeMode, migrationMode, batchSize, cancellationToken);
+
+                    AddTableIfMissing(checkpoint.CompletedTables, tableName);
+                    _logger.Log($"[{currentTable}/{totalTables}] RESULT table `{tableName}`: completed");
+                    LogTableStatus(tableName, "SUCCESS", dbfFile, "Completed.");
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger!.Log($"[{currentTable}/{totalTables}] RESULT table `{tableName}`: failed and skipped. {ex.Message}");
+                    _logger.LogError(tableName, "Table Skipped", ex.Message, ex.ToString());
+                    LogTableStatus(tableName, "FAILED", dbfFile, ex.Message);
+                    LogFailedTableSummary(tableName, dbfFile, ex);
+
+                    try
+                    {
+                        await tableService.DropTableIfExistsAsync(mySqlConn, tableName, cancellationToken);
+                        _logger.Log($"  Removed partially-created MySQL table `{tableName}` after failure.");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.Log($"  ⚠️ Could not remove failed MySQL table `{tableName}`: {cleanupEx.Message}");
+                        _logger.LogError(tableName, "Failed Table Cleanup", cleanupEx.Message, cleanupEx.ToString());
+                    }
+
+                    AddTableIfMissing(checkpoint.FailedTables, tableName);
+                }
+                finally
+                {
+                    checkpoint.CurrentTable = null;
+                    checkpoint.CurrentTableLastCommittedRecordNumber = 0;
+                    checkpoint.LastUpdateTime = DateTime.Now;
+                    await _checkpointService!.SaveCheckpointAsync(checkpoint);
+                }
+            }
+        }
+
+        private void LogTableStatus(string tableName, string status, string dbfFilePath, string message)
+        {
+            try
+            {
+                var entry =
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{status}\t{tableName}\t{dbfFilePath}\t{message}{Environment.NewLine}";
+
+                File.AppendAllText(_tableStatusLogPath, entry);
+            }
+            catch
+            {
+                // Keep the migration moving even if the status file cannot be written.
+            }
+        }
+
+        private void LogFailedTableSummary(string tableName, string dbfFilePath, Exception exception)
+        {
+            try
+            {
+                var entry = new StringBuilder();
+                entry.AppendLine($"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                entry.AppendLine($"Table: {tableName}");
+                entry.AppendLine($"DBF File: {dbfFilePath}");
+                entry.AppendLine($"Error: {exception.Message}");
+                if (exception.InnerException != null)
+                {
+                    entry.AppendLine($"Inner Error: {exception.InnerException.Message}");
+                }
+                entry.AppendLine("Details:");
+                entry.AppendLine(exception.ToString());
+                entry.AppendLine("----------------------------------------");
+                entry.AppendLine();
+
+                File.AppendAllText(_failedTablesLogPath, entry.ToString());
+            }
+            catch
+            {
+                // Keep the migration moving even if the summary file cannot be written.
+            }
+        }
+
+        private static bool ContainsTable(List<string> tables, string tableName)
+        {
+            return tables.Any(t => string.Equals(t, tableName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static void AddTableIfMissing(List<string> tables, string tableName)
+        {
+            if (!ContainsTable(tables, tableName))
+            {
+                tables.Add(tableName);
             }
         }
 
@@ -310,7 +474,31 @@ namespace FoxProToMySqlMigrator
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var schemaReader = new DbfSchemaReader();
-                var (dbfReader, memoStream) = schemaReader.OpenDbfFile(dbfFilePath, out bool hasMemoFile, out string memoFileType);
+                DbfDataReader.DbfDataReader dbfReader;
+                FileStream? memoStream;
+                bool hasMemoFile;
+                string memoFileType;
+
+                try
+                {
+                    (dbfReader, memoStream) = schemaReader.OpenDbfFile(dbfFilePath, out hasMemoFile, out memoFileType);
+                }
+                catch (Exception openEx) when (IsRecoverableDbfOpenFailure(openEx))
+                {
+                    _logger!.Log($"  ⚠️ DbfDataReader could not open `{tableName}` safely: {openEx.Message}");
+                    _logger.Log("  ⚠️ Falling back to raw DBF header/schema parsing and physical record migration for this table.");
+                    await MigrateTableWithPhysicalFallbackAsync(
+                        dbfFilePath,
+                        mySqlConn,
+                        checkpoint,
+                        schemaReader,
+                        tableName,
+                        safeMode,
+                        migrationMode,
+                        batchSize,
+                        cancellationToken);
+                    return;
+                }
                 
                 try
                 {
@@ -323,10 +511,32 @@ namespace FoxProToMySqlMigrator
                         ? checkpoint.CurrentTableLastCommittedRecordNumber
                         : 0;
 
-                    var schema = schemaReader.GetTableSchema(dbfReader, dbfFilePath);
+                    List<DbfColumnInfo> schema;
+                    try
+                    {
+                        schema = schemaReader.GetTableSchema(dbfReader, dbfFilePath);
+                    }
+                    catch (Exception schemaEx) when (IsRecoverableDbfOpenFailure(schemaEx))
+                    {
+                        _logger!.Log($"  ⚠️ DbfDataReader schema extraction failed for `{tableName}`: {schemaEx.Message}");
+                        _logger.Log("  ⚠️ Falling back to raw DBF header/schema parsing and physical record migration for this table.");
+                        await MigrateTableWithPhysicalFallbackAsync(
+                            dbfFilePath,
+                            mySqlConn,
+                            checkpoint,
+                            schemaReader,
+                            tableName,
+                            safeMode,
+                            migrationMode,
+                            batchSize,
+                            cancellationToken);
+                        return;
+                    }
                     using var memoResolver = DbfMemoResolver.TryCreate(dbfFilePath, schema, Encoding.GetEncoding(1252));
+                    using var rawInspector = DbfRawFieldInspector.TryCreate(dbfFilePath, schema, Encoding.GetEncoding(1252));
                     
                     LogSchemaInfo(schema, schemaReader, safeMode);
+                    LogDbfRawTableInfo(rawInspector, schema);
                     
                     var tableService = new MySqlTableService();
                     await tableService.CreateTableAsync(
@@ -352,13 +562,14 @@ namespace FoxProToMySqlMigrator
                         checkpoint,
                         dbfFilePath,
                         memoResolver,
+                        rawInspector,
                         dbfTotalCount,
                         resumeAfterRecordNumber,
                         cancellationToken);
 
                     counters.TotalRecords = dbfTotalCount ?? counters.Accounted;
                     var targetRowCount = await GetTargetRowCountAsync(mySqlConn, tableName, cancellationToken);
-                    var countSummary = GetRecordCountSummary(dbfTotalCount, counters, targetRowCount);
+                    var countSummary = GetRecordCountSummary(dbfTotalCount, counters, targetRowCount, rawInspector?.TableInfo);
                     await LogDateColumnStatsAsync(mySqlConn, tableName, counters.DateStats, cancellationToken);
                     
                     _logger.Log($"  ✓ Completed: {counters.RowCount:N0} rows migrated" + 
@@ -366,16 +577,25 @@ namespace FoxProToMySqlMigrator
                         (counters.Duplicates > 0 ? $", {counters.Duplicates:N0} duplicates accounted" : "") +
                         (counters.Skipped > 0 ? $", {counters.Skipped:N0} skipped" : "") +
                         (counters.Deleted > 0 ? $", {counters.Deleted:N0} marked as deleted" : "") +
-                        (counters.ErrorCount > 0 ? $", {counters.ErrorCount:N0} warnings/errors (see log file)" : ""));
+                        (counters.WarningCount > 0 ? $", {counters.WarningCount:N0} warning(s) repaired" : "") +
+                        (counters.ErrorCount > 0 ? $", {counters.ErrorCount:N0} error(s) (see log file)" : ""));
 
                     LogCounterSummary(counters, countSummary, targetRowCount);
 
-                    // Fire TableCompleted event
+                    if (countSummary.Status == "Mismatch")
+                    {
+                        LogDbfPhysicalRecordDiagnostics(dbfFilePath, countSummary.AccountedCount, dbfTotalCount);
+                        throw new InvalidOperationException(
+                            $"Unexplained DBF record count mismatch for `{tableName}`. DBF header={dbfTotalCount:N0}, read/accounted={countSummary.AccountedCount:N0}, missing={countSummary.MissingCount:N0}. {countSummary.Explanation} Migration was not marked complete.");
+                    }
+
+                    // Fire TableCompleted event only after final table verification passes.
                     TableCompleted?.Invoke(new TableMigrationResult
                     {
                         TableName = tableName,
                         RowCount = counters.RowCount,
                         ErrorCount = counters.ErrorCount,
+                        WarningCount = counters.WarningCount,
                         TotalRecords = counters.TotalRecords,
                         ReadCount = counters.Accounted,
                         InsertedCount = counters.Inserted,
@@ -389,13 +609,6 @@ namespace FoxProToMySqlMigrator
                         MissingCount = countSummary.MissingCount,
                         CountStatus = countSummary.Status
                     });
-
-                    if (countSummary.Status == "Mismatch")
-                    {
-                        LogDbfPhysicalRecordDiagnostics(dbfFilePath, countSummary.AccountedCount, dbfTotalCount);
-                        throw new InvalidOperationException(
-                            $"Unexplained DBF record count mismatch for `{tableName}`. DBF header={dbfTotalCount:N0}, read/accounted={countSummary.AccountedCount:N0}, missing={countSummary.MissingCount:N0}. Migration was not marked complete.");
-                    }
                 }
                 finally
                 {
@@ -424,6 +637,7 @@ namespace FoxProToMySqlMigrator
                     TableName = tableName,
                     RowCount = 0,
                     ErrorCount = 1,
+                    WarningCount = 0,
                     TotalRecords = 0,
                     ReadCount = 0,
                     InsertedCount = 0,
@@ -456,6 +670,165 @@ namespace FoxProToMySqlMigrator
                 _logger.Log($"    - '{col.OriginalName}' -> '{col.Name}' (DBF: {dbfType} → MySQL: {mySqlType})");
             }
             _logger.Log($"    - DBF Deletion Flag -> 'is_deleted' (Boolean → BOOLEAN)");
+        }
+
+        private async Task MigrateTableWithPhysicalFallbackAsync(
+            string dbfFilePath,
+            MySqlConnection mySqlConn,
+            MigrationCheckpoint checkpoint,
+            DbfSchemaReader schemaReader,
+            string tableName,
+            bool safeMode,
+            MigrationMode migrationMode,
+            int batchSize,
+            CancellationToken cancellationToken)
+        {
+            var schema = schemaReader.GetTableSchemaFromHeader(dbfFilePath);
+            if (schema.Count == 0)
+            {
+                throw new InvalidOperationException("Could not recover DBF schema from raw header.");
+            }
+
+            using var memoResolver = DbfMemoResolver.TryCreate(dbfFilePath, schema, Encoding.GetEncoding(1252));
+            using var rawInspector = DbfRawFieldInspector.TryCreate(dbfFilePath, schema, Encoding.GetEncoding(1252));
+            long? dbfTotalCount = rawInspector?.TableInfo.HeaderRecordCount;
+            var physicalCapacity = rawInspector?.TableInfo.PhysicalRecordCapacity;
+
+            LogSchemaInfo(schema, schemaReader, safeMode);
+            LogDbfRawTableInfo(rawInspector, schema);
+
+            var tableService = new MySqlTableService();
+            await tableService.CreateTableAsync(
+                mySqlConn,
+                tableName,
+                schema,
+                safeMode,
+                migrationMode,
+                preserveExistingRows: checkpoint.CurrentTableLastCommittedRecordNumber > 0,
+                cancellationToken);
+
+            _logger!.Log($"  Created table using raw DBF header fallback with AUTO_INCREMENT primary_id and {schema.Count} data columns.");
+
+            var counters = new MigrationCounters
+            {
+                ResumeSkipped = checkpoint.CurrentTableLastCommittedRecordNumber,
+                DateStats = CreateDateColumnStats(schema)
+            };
+            var recordTracking = new RecordTrackingService(_errorRecordsFolder, _skippedRecordsFolder, _repairedRecordsFolder, tableName);
+            try
+            {
+                var batchRows = new List<object?[]>();
+                var batchRecordNumbers = new List<long>();
+                var bulkInsertService = new BulkInsertService();
+                var physicalMaxRecordNumber = physicalCapacity > (dbfTotalCount ?? 0)
+                    ? physicalCapacity
+                    : dbfTotalCount;
+
+                var result = await CopyPhysicalRecordsAsync(
+                    mySqlConn,
+                    tableName,
+                    schema,
+                    migrationMode,
+                    batchSize,
+                    checkpoint,
+                    dbfFilePath,
+                    memoResolver,
+                    physicalMaxRecordNumber,
+                    Math.Max(1, checkpoint.CurrentTableLastCommittedRecordNumber + 1),
+                    counters,
+                    recordTracking,
+                    bulkInsertService,
+                    batchRows,
+                    batchRecordNumbers,
+                    null,
+                    0,
+                    0,
+                    cancellationToken);
+
+                if (batchRows.Count > 0)
+                {
+                    var (skippedInFinalBatch, failedInFinalBatch) = await ProcessFinalBatch(
+                        mySqlConn,
+                        result.Transaction,
+                        tableName,
+                        BuildColumnNames(schema),
+                        schema,
+                        batchRows,
+                        batchRecordNumbers,
+                        migrationMode,
+                        result.BatchNumber + 1,
+                        counters.RowCount,
+                        bulkInsertService,
+                        recordTracking,
+                        cancellationToken);
+                    counters.Duplicates += skippedInFinalBatch;
+                    counters.Failed += failedInFinalBatch;
+                    counters.Inserted += batchRows.Count - skippedInFinalBatch - failedInFinalBatch;
+                    await SaveTableProgressCheckpointAsync(checkpoint, tableName, batchRecordNumbers[^1]);
+                }
+
+                counters.TotalRecords = dbfTotalCount ?? counters.Accounted;
+                var targetRowCount = await GetTargetRowCountAsync(mySqlConn, tableName, cancellationToken);
+                var countSummary = GetRecordCountSummary(dbfTotalCount, counters, targetRowCount, rawInspector?.TableInfo);
+                await LogDateColumnStatsAsync(mySqlConn, tableName, counters.DateStats, cancellationToken);
+                LogCounterSummary(counters, countSummary, targetRowCount);
+                LogTrackingFiles(recordTracking);
+
+                if (countSummary.Status == "Mismatch")
+                {
+                    LogDbfPhysicalRecordDiagnostics(dbfFilePath, countSummary.AccountedCount, dbfTotalCount);
+                    throw new InvalidOperationException(
+                        $"Unexplained DBF record count mismatch for `{tableName}` after raw physical fallback. DBF header={dbfTotalCount:N0}, accounted={countSummary.AccountedCount:N0}. {countSummary.Explanation}");
+                }
+
+                TableCompleted?.Invoke(new TableMigrationResult
+                {
+                    TableName = tableName,
+                    RowCount = counters.RowCount,
+                    ErrorCount = counters.ErrorCount,
+                    WarningCount = counters.WarningCount,
+                    TotalRecords = counters.TotalRecords,
+                    ReadCount = counters.Accounted,
+                    InsertedCount = counters.Inserted,
+                    UpdatedCount = counters.Updated,
+                    DeletedCount = counters.Deleted,
+                    DuplicateCount = counters.Duplicates,
+                    SkippedCount = counters.Skipped,
+                    FailedCount = counters.Failed,
+                    DbfTotalCount = dbfTotalCount,
+                    AccountedCount = countSummary.AccountedCount,
+                    MissingCount = countSummary.MissingCount,
+                    CountStatus = countSummary.Status
+                });
+            }
+            finally
+            {
+                recordTracking.Dispose();
+            }
+        }
+
+        private void LogDbfRawTableInfo(DbfRawFieldInspector? rawInspector, List<DbfColumnInfo> schema)
+        {
+            if (rawInspector == null)
+            {
+                _logger!.Log("  ⚠️ Raw DBF inspection unavailable for this table; repaired date logs will not include source bytes.");
+                return;
+            }
+
+            var info = rawInspector.TableInfo;
+            _logger!.Log($"  DBF header: version=0x{info.Version:X2}, lastUpdate={(info.LastUpdateDate.HasValue ? info.LastUpdateDate.Value.ToString("yyyy-MM-dd") : "unknown")}, headerRecords={info.HeaderRecordCount:N0}, headerLength={info.HeaderLength:N0}, recordLength={info.RecordLength:N0}, fileBytes={info.FileLength:N0}, physicalCapacity={info.PhysicalRecordCapacity:N0}");
+
+            var dateColumns = schema
+                .Where(c => c.DbfFieldType == 'D' || c.DbfFieldType == 'T' || c.ColumnType == typeof(DateTime))
+                .ToList();
+
+            if (dateColumns.Count == 0)
+            {
+                _logger.Log("  DBF date fields: none");
+                return;
+            }
+
+            _logger.Log($"  DBF date fields: {string.Join(", ", dateColumns.Select(c => $"{c.OriginalName}[type={c.DbfFieldType}, length={c.Length}]"))}");
         }
         
         private string GetDbfTypeDescription(char dbfType, int length, int decimalCount)
@@ -582,24 +955,79 @@ namespace FoxProToMySqlMigrator
             }
         }
 
-        private (string Status, long AccountedCount, long MissingCount) GetRecordCountSummary(
+        private bool IsRecoverableDbfOpenFailure(Exception exception)
+        {
+            return exception is ArgumentOutOfRangeException
+                || exception is IndexOutOfRangeException
+                || exception.Message.Contains("ReadColumns", StringComparison.OrdinalIgnoreCase)
+                || exception.Message.Contains("startIndex", StringComparison.OrdinalIgnoreCase)
+                || exception.Message.Contains("length", StringComparison.OrdinalIgnoreCase)
+                || exception.InnerException != null && IsRecoverableDbfOpenFailure(exception.InnerException);
+        }
+
+        private CountSummary GetRecordCountSummary(
             long? dbfTotalCount,
             MigrationCounters counters,
-            long? targetRowCount)
+            long? targetRowCount,
+            DbfTableRawInfo? rawInfo)
         {
             var accountedCount = counters.Accounted;
 
             if (!dbfTotalCount.HasValue)
             {
-                return ("Unknown", accountedCount, 0);
+                return new CountSummary
+                {
+                    Status = "Unknown",
+                    AccountedCount = accountedCount,
+                    MissingCount = 0,
+                    Explanation = "DBF reader did not expose a header record count."
+                };
             }
 
             if (accountedCount == dbfTotalCount.Value)
             {
-                return ("Match", accountedCount, 0);
+                return new CountSummary
+                {
+                    Status = "Match",
+                    AccountedCount = accountedCount,
+                    MissingCount = 0,
+                    Explanation = "Read/accounted records match the DBF header count."
+                };
             }
 
-            return ("Mismatch", accountedCount, Math.Max(0, dbfTotalCount.Value - accountedCount));
+            if (accountedCount > dbfTotalCount.Value)
+            {
+                return new CountSummary
+                {
+                    Status = "Accounted",
+                    AccountedCount = accountedCount,
+                    MissingCount = 0,
+                    Explanation = rawInfo != null && rawInfo.PhysicalRecordCapacity >= accountedCount
+                        ? $"DBF header under-reports records. Header={dbfTotalCount.Value:N0}, physicalCapacity={rawInfo.PhysicalRecordCapacity:N0}, accounted={accountedCount:N0}."
+                        : $"DBF header under-reports records. Header={dbfTotalCount.Value:N0}, accounted={accountedCount:N0}."
+                };
+            }
+
+            if (rawInfo != null && accountedCount == rawInfo.PhysicalRecordCapacity && rawInfo.PhysicalRecordCapacity < dbfTotalCount.Value)
+            {
+                return new CountSummary
+                {
+                    Status = "Accounted",
+                    AccountedCount = accountedCount,
+                    MissingCount = 0,
+                    Explanation = $"DBF header overstates records. Header={dbfTotalCount.Value:N0}, physicalCapacity={rawInfo.PhysicalRecordCapacity:N0}, accounted all physical record slots."
+                };
+            }
+
+            return new CountSummary
+            {
+                Status = "Mismatch",
+                AccountedCount = accountedCount,
+                MissingCount = Math.Max(0, dbfTotalCount.Value - accountedCount),
+                Explanation = rawInfo != null
+                    ? $"Header={dbfTotalCount.Value:N0}, physicalCapacity={rawInfo.PhysicalRecordCapacity:N0}, accounted={accountedCount:N0}."
+                    : $"Header={dbfTotalCount.Value:N0}, accounted={accountedCount:N0}; raw physical info unavailable."
+            };
         }
 
         private async Task<long?> GetTargetRowCountAsync(
@@ -622,12 +1050,17 @@ namespace FoxProToMySqlMigrator
 
         private void LogCounterSummary(
             MigrationCounters counters,
-            (string Status, long AccountedCount, long MissingCount) countSummary,
+            CountSummary countSummary,
             long? targetRowCount)
         {
-            _logger!.Log($"  📊 Counters: TotalRecords={counters.TotalRecords:N0}, Read={counters.Accounted:N0}, Inserted={counters.Inserted:N0}, Updated={counters.Updated:N0}, Deleted={counters.Deleted:N0}, Duplicates={counters.Duplicates:N0}, Skipped={counters.Skipped:N0}, Failed={counters.Failed:N0}");
+            _logger!.Log($"  📊 Counters: TotalRecords={counters.TotalRecords:N0}, Read={counters.Accounted:N0}, Inserted={counters.Inserted:N0}, Updated={counters.Updated:N0}, Deleted={counters.Deleted:N0}, Duplicates={counters.Duplicates:N0}, Skipped={counters.Skipped:N0}, Failed={counters.Failed:N0}, PhysicalRecovered={counters.PhysicalRecovered:N0}, ReaderFailuresRecovered={counters.ReaderFailuresRecovered:N0}");
             _logger.Log($"  📊 Verification: source accounted={countSummary.AccountedCount:N0}/{counters.TotalRecords:N0}, target rows={(targetRowCount?.ToString("N0") ?? "unknown")}, status={countSummary.Status}" +
                 (countSummary.MissingCount > 0 ? $", unexplained missing={countSummary.MissingCount:N0}" : ""));
+            _logger.Log($"  📊 Count explanation: {countSummary.Explanation}");
+            if (counters.PhysicalEofMarkers > 0 || counters.PhysicalUnexpectedMarkers > 0)
+            {
+                _logger.Log($"  📊 Physical markers: eofSlots={counters.PhysicalEofMarkers:N0}, unexpectedMarkers={counters.PhysicalUnexpectedMarkers:N0}");
+            }
         }
 
         private void LogDbfPhysicalRecordDiagnostics(
@@ -765,6 +1198,7 @@ namespace FoxProToMySqlMigrator
             MigrationCheckpoint checkpoint,
             string dbfFilePath,
             DbfMemoResolver? memoResolver,
+            DbfRawFieldInspector? rawInspector,
             long? dbfTotalCount,
             long resumeAfterRecordNumber,
             CancellationToken cancellationToken = default)
@@ -791,8 +1225,29 @@ namespace FoxProToMySqlMigrator
             
             try
             {
-                while (dbfReader.Read())
+                long? forcedPhysicalStartRecordNumber = null;
+                while (true)
                 {
+                    bool hasRecord;
+                    try
+                    {
+                        hasRecord = dbfReader.Read();
+                    }
+                    catch (Exception readEx)
+                    {
+                        counters.ReaderFailuresRecovered++;
+                        forcedPhysicalStartRecordNumber = Math.Max(recordNumber, resumeAfterRecordNumber) + 1;
+                        _logger!.Log($"  ⚠️ DbfDataReader.Read failed after logical record #{recordNumber:N0}: {readEx.Message}");
+                        _logger.Log($"  ⚠️ Falling back to physical DBF reader from record #{forcedPhysicalStartRecordNumber:N0} so remaining records can still be attempted.");
+                        _logger.LogError(tableName, $"Reader failure after record #{recordNumber}", readEx.Message, readEx.ToString());
+                        break;
+                    }
+
+                    if (!hasRecord)
+                    {
+                        break;
+                    }
+
                     if (recordNumber % 100 == 0)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
@@ -816,12 +1271,11 @@ namespace FoxProToMySqlMigrator
                             counters.Deleted++;
                         }
 
-                        var (rowData, repairMessages) = ExtractRowData(dbfReader, schema, isDeleted, memoResolver, recordNumber);
+                        var (rowData, repairMessages) = ExtractRowData(dbfReader, schema, isDeleted, memoResolver, rawInspector, recordNumber);
                         TrackDateColumnStats(counters.DateStats, schema, rowData);
                         if (repairMessages.Count > 0)
                         {
                             counters.ConversionWarnings += repairMessages.Count;
-                            recordTracking.LogErrorRowData(recordNumber, schema, rowData, string.Join(" | ", repairMessages));
                             recordTracking.LogRepairedRowData(recordNumber, schema, rowData, string.Join(" | ", repairMessages));
                         }
 
@@ -891,97 +1345,36 @@ namespace FoxProToMySqlMigrator
                     }
                 }
 
-                if (dbfTotalCount.HasValue && recordNumber < dbfTotalCount.Value)
+                if (forcedPhysicalStartRecordNumber.HasValue || dbfTotalCount.HasValue && recordNumber < dbfTotalCount.Value)
                 {
-                    var physicalStartRecordNumber = Math.Max(recordNumber, resumeAfterRecordNumber) + 1;
-                    _logger!.Log($"  ⚠️ DbfDataReader stopped at record #{recordNumber:N0}, but DBF header says {dbfTotalCount.Value:N0}. Forcing physical DBF read from record #{physicalStartRecordNumber:N0}.");
-
-                    var physicalReader = new DbfPhysicalRecordReader(Encoding.GetEncoding(1252));
-                    foreach (var physicalRecord in physicalReader.ReadRecords(dbfFilePath, schema, physicalStartRecordNumber, dbfTotalCount))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        recordNumber = physicalRecord.RecordNumber;
-                        counters.Read++;
-
-                        if (physicalRecord.Marker == 0x1A)
-                        {
-                            counters.Skipped++;
-                            recordTracking.LogSkippedRowData(
-                                physicalRecord.RecordNumber,
-                                schema,
-                                physicalRecord.Values,
-                                "Physical DBF fallback found EOF marker at this record slot; counted as skipped/accounted.");
-                            continue;
-                        }
-
-                        if (physicalRecord.Marker != 0x20 && physicalRecord.Marker != 0x2A && physicalRecord.Marker != 0x00)
-                        {
-                            counters.ConversionWarnings++;
-                            recordTracking.LogErrorRowData(
-                                physicalRecord.RecordNumber,
-                                schema,
-                                physicalRecord.Values,
-                                $"Physical DBF fallback found unexpected record marker 0x{physicalRecord.Marker:X2}; attempted to preserve row.");
-                        }
-
-                        if (physicalRecord.IsDeleted)
-                        {
-                            counters.Deleted++;
-                        }
-
-                        var (rowData, repairMessages) = ExtractPhysicalRowData(schema, physicalRecord, memoResolver);
-                        TrackDateColumnStats(counters.DateStats, schema, rowData);
-                        if (repairMessages.Count > 0)
-                        {
-                            counters.ConversionWarnings += repairMessages.Count;
-                            recordTracking.LogErrorRowData(physicalRecord.RecordNumber, schema, rowData, string.Join(" | ", repairMessages));
-                            recordTracking.LogRepairedRowData(physicalRecord.RecordNumber, schema, rowData, string.Join(" | ", repairMessages));
-                        }
-
-                        estimatedBatchBytes += EstimateRowPayloadBytes(rowData);
-                        batchRows.Add(rowData);
-                        batchRecordNumbers.Add(physicalRecord.RecordNumber);
-
-                        if (batchRows.Count >= batchSize || estimatedBatchBytes >= MaxEstimatedBatchBytes)
-                        {
-                            try
-                            {
-                                var (newTransaction, skippedInBatch, failedInBatch) = await ProcessBatch(
-                                    mySqlConn, transaction, tableName, columnNames, schema,
-                                    batchRows, batchRecordNumbers, migrationMode, ++batchNumber, counters.RowCount,
-                                    bulkInsertService, recordTracking, cancellationToken);
-                                transaction = newTransaction;
-                                counters.Duplicates += skippedInBatch;
-                                counters.Failed += failedInBatch;
-                                counters.Inserted += batchRows.Count - skippedInBatch - failedInBatch;
-                                await SaveTableProgressCheckpointAsync(checkpoint, tableName, batchRecordNumbers[^1]);
-                                batchRows.Clear();
-                                batchRecordNumbers.Clear();
-                                estimatedBatchBytes = 0;
-                            }
-                            catch (Exception batchEx)
-                            {
-                                _logger!.Log($"  ❌ CRITICAL: Forced physical-read batch failed at batch #{batchNumber}");
-                                _logger.Log($"  Error: {batchEx.Message}");
-
-                                if (transaction != null)
-                                {
-                                    try
-                                    {
-                                        await transaction.RollbackAsync();
-                                        await transaction.DisposeAsync();
-                                    }
-                                    catch { }
-                                    transaction = null;
-                                }
-
-                                batchRows.Clear();
-                                batchRecordNumbers.Clear();
-                                estimatedBatchBytes = 0;
-                                throw new Exception($"Forced physical DBF read batch failed at batch #{batchNumber}.", batchEx);
-                            }
-                        }
-                    }
+                    var physicalStartRecordNumber = forcedPhysicalStartRecordNumber ?? Math.Max(recordNumber, resumeAfterRecordNumber) + 1;
+                    _logger!.Log($"  ⚠️ DbfDataReader stopped at record #{recordNumber:N0}; DBF header says {(dbfTotalCount?.ToString("N0") ?? "unknown")}. Forcing physical DBF read from record #{physicalStartRecordNumber:N0}.");
+                    var physicalFallbackMaxRecord = rawInspector?.TableInfo.PhysicalRecordCapacity > (dbfTotalCount ?? 0)
+                        ? rawInspector.TableInfo.PhysicalRecordCapacity
+                        : dbfTotalCount;
+                    var physicalCopyResult = await CopyPhysicalRecordsAsync(
+                        mySqlConn,
+                        tableName,
+                        schema,
+                        migrationMode,
+                        batchSize,
+                        checkpoint,
+                        dbfFilePath,
+                        memoResolver,
+                        physicalFallbackMaxRecord,
+                        physicalStartRecordNumber,
+                        counters,
+                        recordTracking,
+                        bulkInsertService,
+                        batchRows,
+                        batchRecordNumbers,
+                        transaction,
+                        batchNumber,
+                        estimatedBatchBytes,
+                        cancellationToken);
+                    estimatedBatchBytes = physicalCopyResult.EstimatedBatchBytes;
+                    transaction = physicalCopyResult.Transaction;
+                    batchNumber = physicalCopyResult.BatchNumber;
                 }
                 
                 if (batchRows.Count > 0)
@@ -1040,6 +1433,123 @@ namespace FoxProToMySqlMigrator
             return counters;
         }
 
+        private async Task<PhysicalCopyResult> CopyPhysicalRecordsAsync(
+            MySqlConnection mySqlConn,
+            string tableName,
+            List<DbfColumnInfo> schema,
+            MigrationMode migrationMode,
+            int batchSize,
+            MigrationCheckpoint checkpoint,
+            string dbfFilePath,
+            DbfMemoResolver? memoResolver,
+            long? dbfTotalCount,
+            long physicalStartRecordNumber,
+            MigrationCounters counters,
+            RecordTrackingService recordTracking,
+            BulkInsertService bulkInsertService,
+            List<object?[]> batchRows,
+            List<long> batchRecordNumbers,
+            MySqlTransaction? transaction,
+            int batchNumber,
+            long estimatedBatchBytes,
+            CancellationToken cancellationToken)
+        {
+            var physicalReader = new DbfPhysicalRecordReader(Encoding.GetEncoding(1252));
+            foreach (var physicalRecord in physicalReader.ReadRecords(dbfFilePath, schema, physicalStartRecordNumber, dbfTotalCount))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                counters.Read++;
+
+                if (physicalRecord.Marker == 0x1A)
+                {
+                    counters.Skipped++;
+                    counters.PhysicalEofMarkers++;
+                    recordTracking.LogSkippedRowData(
+                        physicalRecord.RecordNumber,
+                        schema,
+                        physicalRecord.Values,
+                        "Physical DBF fallback found EOF marker at this record slot; counted as skipped/accounted.");
+                    continue;
+                }
+
+                if (physicalRecord.Marker != 0x20 && physicalRecord.Marker != 0x2A && physicalRecord.Marker != 0x00)
+                {
+                    counters.ConversionWarnings++;
+                    counters.PhysicalUnexpectedMarkers++;
+                    recordTracking.LogErrorRowData(
+                        physicalRecord.RecordNumber,
+                        schema,
+                        physicalRecord.Values,
+                        $"Physical DBF fallback found unexpected record marker 0x{physicalRecord.Marker:X2}; attempted to preserve row.");
+                }
+
+                if (physicalRecord.IsDeleted)
+                {
+                    counters.Deleted++;
+                }
+
+                var (rowData, repairMessages) = ExtractPhysicalRowData(schema, physicalRecord, memoResolver);
+                counters.PhysicalRecovered++;
+                TrackDateColumnStats(counters.DateStats, schema, rowData);
+                if (repairMessages.Count > 0)
+                {
+                    counters.ConversionWarnings += repairMessages.Count;
+                    recordTracking.LogRepairedRowData(physicalRecord.RecordNumber, schema, rowData, string.Join(" | ", repairMessages));
+                }
+
+                estimatedBatchBytes += EstimateRowPayloadBytes(rowData);
+                batchRows.Add(rowData);
+                batchRecordNumbers.Add(physicalRecord.RecordNumber);
+
+                if (batchRows.Count >= batchSize || estimatedBatchBytes >= MaxEstimatedBatchBytes)
+                {
+                    try
+                    {
+                        var (newTransaction, skippedInBatch, failedInBatch) = await ProcessBatch(
+                            mySqlConn, transaction, tableName, BuildColumnNames(schema), schema,
+                            batchRows, batchRecordNumbers, migrationMode, ++batchNumber, counters.RowCount,
+                            bulkInsertService, recordTracking, cancellationToken);
+                        transaction = newTransaction;
+                        counters.Duplicates += skippedInBatch;
+                        counters.Failed += failedInBatch;
+                        counters.Inserted += batchRows.Count - skippedInBatch - failedInBatch;
+                        await SaveTableProgressCheckpointAsync(checkpoint, tableName, batchRecordNumbers[^1]);
+                        batchRows.Clear();
+                        batchRecordNumbers.Clear();
+                        estimatedBatchBytes = 0;
+                    }
+                    catch (Exception batchEx)
+                    {
+                        _logger!.Log($"  ❌ CRITICAL: Forced physical-read batch failed at batch #{batchNumber}");
+                        _logger.Log($"  Error: {batchEx.Message}");
+
+                        if (transaction != null)
+                        {
+                            try
+                            {
+                                await transaction.RollbackAsync();
+                                await transaction.DisposeAsync();
+                            }
+                            catch { }
+                            transaction = null;
+                        }
+
+                        batchRows.Clear();
+                        batchRecordNumbers.Clear();
+                        estimatedBatchBytes = 0;
+                        throw new Exception($"Forced physical DBF read batch failed at batch #{batchNumber}.", batchEx);
+                    }
+                }
+            }
+
+            return new PhysicalCopyResult
+            {
+                Transaction = transaction,
+                BatchNumber = batchNumber,
+                EstimatedBatchBytes = estimatedBatchBytes
+            };
+        }
+
         private long EstimateRowPayloadBytes(object?[] row)
         {
             long bytes = 0;
@@ -1071,16 +1581,18 @@ namespace FoxProToMySqlMigrator
             DbfPhysicalRecord physicalRecord,
             DbfMemoResolver? memoResolver)
         {
-            var rowData = new object?[schema.Count + 1];
+            var rowData = new object?[schema.Count + 2];
             var repairMessages = new List<string>();
 
             for (var i = 0; i < schema.Count; i++)
             {
                 var value = physicalRecord.Values.Length > i ? physicalRecord.Values[i] : DBNull.Value;
-                rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, physicalRecord.RecordNumber);
+                var rawField = physicalRecord.RawFields.Length > i ? physicalRecord.RawFields[i] : null;
+                rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, physicalRecord.RecordNumber, rawField);
             }
 
             rowData[schema.Count] = physicalRecord.IsDeleted;
+            rowData[schema.Count + 1] = GetMigrationRemarksValue(repairMessages);
             return (rowData, repairMessages);
         }
 
@@ -1143,6 +1655,41 @@ namespace FoxProToMySqlMigrator
             return dateValue.Year >= 1000 && dateValue.Year <= 9999;
         }
 
+        private bool TryParseDateText(string rawValue, out DateTime parsedDate)
+        {
+            parsedDate = default;
+            var normalized = rawValue.Trim();
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return false;
+            }
+
+            var exactFormats = new[]
+            {
+                "yyyyMMdd",
+                "yyyy-MM-dd",
+                "yyyy/MM/dd",
+                "M/d/yyyy",
+                "MM/dd/yyyy",
+                "M-d-yyyy",
+                "MM-dd-yyyy",
+                "yyyy-MM-dd HH:mm:ss",
+                "yyyy/MM/dd HH:mm:ss",
+                "M/d/yyyy h:mm:ss tt",
+                "MM/dd/yyyy h:mm:ss tt",
+                "M/d/yyyy hh:mm:ss tt",
+                "MM/dd/yyyy hh:mm:ss tt"
+            };
+
+            return DateTime.TryParseExact(
+                    normalized,
+                    exactFormats,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AllowWhiteSpaces,
+                    out parsedDate)
+                && IsValidMySqlDate(parsedDate);
+        }
+
         private void TrackDateColumnStats(List<DateColumnMigrationStats> dateStats, List<DbfColumnInfo> schema, object?[] rowData)
         {
             if (dateStats.Count == 0)
@@ -1182,7 +1729,7 @@ namespace FoxProToMySqlMigrator
                 return true;
             }
 
-            return DateTime.TryParse(value.ToString(), out dateValue);
+            return TryParseDateText(value.ToString() ?? "", out dateValue);
         }
 
         private async Task LogDateColumnStatsAsync(
@@ -1258,6 +1805,7 @@ namespace FoxProToMySqlMigrator
         {
             var allColumnNames = schema.Select(c => $"`{c.Name}`").ToList();
             allColumnNames.Add("`is_deleted`");
+            allColumnNames.Add("`migration_remarks`");
             return string.Join(", ", allColumnNames);
         }
 
@@ -1284,9 +1832,10 @@ namespace FoxProToMySqlMigrator
             List<DbfColumnInfo> schema, 
             bool isDeleted,
             DbfMemoResolver? memoResolver,
+            DbfRawFieldInspector? rawInspector,
             long recordNumber)
         {
-            var rowData = new object?[schema.Count + 1];
+            var rowData = new object?[schema.Count + 2];
             var repairMessages = new List<string>();
             
             for (int i = 0; i < schema.Count; i++)
@@ -1294,8 +1843,13 @@ namespace FoxProToMySqlMigrator
                 try
                 {
                     var value = dbfReader.GetValue(i);
-                    
-                    rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, recordNumber);
+                    DbfRawFieldValue? rawField = null;
+                    if (rawInspector?.TryReadField(recordNumber, schema[i], out var inspectedRawField) == true)
+                    {
+                        rawField = inspectedRawField;
+                    }
+
+                    rowData[i] = NormalizeValueForColumn(schema[i], value, repairMessages, memoResolver, recordNumber, rawField);
                 }
                 catch (Exception ex)
                 {
@@ -1311,12 +1865,20 @@ namespace FoxProToMySqlMigrator
                     }
 
                     rowData[i] = GetCorruptedFallbackValue(schema[i]);
-                    repairMessages.Add($"{schema[i].OriginalName}: read failed, inserted fallback value ({ex.Message})");
+                    repairMessages.Add($"{schema[i].OriginalName}: record #{recordNumber} field read failed, inserted fallback value ({ex.Message})");
                 }
             }
             
             rowData[schema.Count] = isDeleted;
+            rowData[schema.Count + 1] = GetMigrationRemarksValue(repairMessages);
             return (rowData, repairMessages);
+        }
+
+        private object GetMigrationRemarksValue(List<string> repairMessages)
+        {
+            return repairMessages.Count == 0
+                ? DBNull.Value
+                : string.Join(" | ", repairMessages);
         }
 
         private object? NormalizeValueForColumn(
@@ -1324,7 +1886,8 @@ namespace FoxProToMySqlMigrator
             object? value,
             List<string> repairMessages,
             DbfMemoResolver? memoResolver = null,
-            long recordNumber = 0)
+            long recordNumber = 0,
+            DbfRawFieldValue? rawField = null)
         {
             if (column.DbfFieldType == 'M' &&
                 memoResolver?.TryResolveMemo(column, recordNumber, value, out var resolvedMemo, out var memoRepairMessage) == true)
@@ -1344,7 +1907,7 @@ namespace FoxProToMySqlMigrator
 
             if (IsDateColumn(column))
             {
-                return NormalizeDateValue(column, value, repairMessages);
+                return NormalizeDateValue(column, value, repairMessages, rawField);
             }
 
             if (IsNumericColumn(column))
@@ -1372,7 +1935,11 @@ namespace FoxProToMySqlMigrator
             return value;
         }
 
-        private object NormalizeDateValue(DbfColumnInfo column, object value, List<string> repairMessages)
+        private object NormalizeDateValue(
+            DbfColumnInfo column,
+            object value,
+            List<string> repairMessages,
+            DbfRawFieldValue? rawField)
         {
             if (value is DateTime dateValue)
             {
@@ -1381,7 +1948,7 @@ namespace FoxProToMySqlMigrator
                     return dateValue;
                 }
 
-                repairMessages.Add($"{column.OriginalName}: invalid MySQL date '{dateValue:yyyy-MM-dd HH:mm:ss}', inserted NULL");
+                repairMessages.Add($"{column.OriginalName}: invalid MySQL date '{dateValue:yyyy-MM-dd HH:mm:ss}', inserted NULL{FormatRawFieldTrace(rawField)}");
                 return DBNull.Value;
             }
 
@@ -1391,14 +1958,35 @@ namespace FoxProToMySqlMigrator
                 return DBNull.Value;
             }
 
-            if (DateTime.TryParse(rawValue, out var parsedDate) && IsValidMySqlDate(parsedDate))
+            if (TryParseDateText(rawValue, out var parsedDate))
             {
                 repairMessages.Add($"{column.OriginalName}: date was stored/read as text '{rawValue}', parsed successfully");
                 return parsedDate;
             }
 
-            repairMessages.Add($"{column.OriginalName}: invalid date value '{rawValue}', inserted NULL");
+            repairMessages.Add($"{column.OriginalName}: invalid date value '{rawValue}', inserted NULL{FormatRawFieldTrace(rawField)}");
             return DBNull.Value;
+        }
+
+        private string FormatRawFieldTrace(DbfRawFieldValue? rawField)
+        {
+            if (rawField == null)
+            {
+                return "";
+            }
+
+            var rawText = rawField.Text.Length == 0 ? "<blank>" : rawField.Text;
+            return $" [DBF raw: record={rawField.RecordNumber}, column={rawField.ColumnName}, type={rawField.FieldType}, length={rawField.Length}, offset={rawField.Offset}, text='{rawText}', hex={rawField.Hex}]";
+        }
+
+        private string GetDateTypeDescription(DbfColumnInfo column)
+        {
+            return column.DbfFieldType switch
+            {
+                'D' => "Date",
+                'T' => "DateTime",
+                _ => "date value"
+            };
         }
 
         private object NormalizeNumericValue(DbfColumnInfo column, object value, List<string> repairMessages)
@@ -1467,6 +2055,11 @@ namespace FoxProToMySqlMigrator
 
         private object? GetCorruptedFallbackValue(DbfColumnInfo column)
         {
+            if (column.DbfFieldType == 'M')
+            {
+                return DBNull.Value;
+            }
+
             if (!IsTextColumn(column))
             {
                 return DBNull.Value;

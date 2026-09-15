@@ -181,9 +181,17 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel>
-                <TextBlock Text="FoxPro to MySQL Migrator"
-                           FontSize="23"
-                           FontWeight="Bold"/>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="FoxPro to MySQL Migrator"
+                               FontSize="23"
+                               FontWeight="Bold"/>
+                    <TextBlock x:Name="TxtAppVersion"
+                               Text="v0.0.0.0"
+                               Foreground="{StaticResource SecondaryTextBrush}"
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Margin="10,8,0,0"/>
+                </StackPanel>
                 <TextBlock Text="Move DBF tables into MySQL with checkpoints, repair logs, and table-level status."
                            Foreground="{StaticResource SecondaryTextBrush}"
                            FontSize="13"
@@ -199,7 +207,8 @@
                     VerticalAlignment="Center">
                 <StackPanel Orientation="Horizontal">
                     <Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" Margin="0,0,8,0"/>
-                    <TextBlock Text="Ready"
+                    <TextBlock x:Name="TxtStatusBadge"
+                               Text="Ready"
                                Foreground="{StaticResource AccentHoverBrush}"
                                FontWeight="SemiBold"
                                VerticalAlignment="Center"/>
@@ -427,9 +436,21 @@
                             <RowDefinition Height="*"/>
                         </Grid.RowDefinitions>
 
-                        <TextBlock Grid.Row="0"
-                                   Text="Migration Log"
-                                   Style="{StaticResource SectionTitleStyle}"/>
+                        <Grid Grid.Row="0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Migration Log"
+                                       Style="{StaticResource SectionTitleStyle}"/>
+                            <CheckBox Grid.Column="1"
+                                      x:Name="ChkFollowLog"
+                                      Content="Follow log"
+                                      IsChecked="False"
+                                      Margin="12,0,0,10"
+                                      VerticalAlignment="Top"/>
+                        </Grid>
                         <ListBox Grid.Row="1"
                                  x:Name="LstLog"
                                  FontFamily="Consolas"

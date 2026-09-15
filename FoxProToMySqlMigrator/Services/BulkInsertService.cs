@@ -45,6 +45,9 @@ namespace FoxProToMySqlMigrator.Services
         {
             if (rows == null || rows.Count == 0) return new BulkInsertResult();
 
+            var result = new BulkInsertResult();
+            RepairInvalidDateValues(schema, rows, result);
+
             try
             {
                 var sql = new StringBuilder();
@@ -80,8 +83,6 @@ namespace FoxProToMySqlMigrator.Services
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 
-                var result = new BulkInsertResult();
-
                 try
                 {
                     await cmd.ExecuteNonQueryAsync(linkedCts.Token);
@@ -111,6 +112,7 @@ namespace FoxProToMySqlMigrator.Services
 
                         var left = await ExecuteBulkInsertAsync(connection, transaction, tableName, columnNames, schema, firstHalf, migrationMode, cancellationToken);
                         var splitResult = new BulkInsertResult();
+                        splitResult.RepairedRows.AddRange(result.RepairedRows);
                         splitResult.SkippedRows.AddRange(left.SkippedRows);
                         splitResult.RepairedRows.AddRange(left.RepairedRows);
                         splitResult.FailedRows.AddRange(left.FailedRows);
@@ -141,7 +143,7 @@ namespace FoxProToMySqlMigrator.Services
                 }
                 catch (Exception ex) when (rows.Count > 1 && IsBatchSizeError(ex))
                 {
-                    return await ExecuteSplitBatchAsync(
+                    var splitResult = await ExecuteSplitBatchAsync(
                         connection,
                         transaction,
                         tableName,
@@ -150,6 +152,8 @@ namespace FoxProToMySqlMigrator.Services
                         rows,
                         migrationMode,
                         cancellationToken);
+                    splitResult.RepairedRows.InsertRange(0, result.RepairedRows);
+                    return splitResult;
                 }
                 catch (Exception ex) when (rows.Count == 1 && IsBatchSizeError(ex))
                 {
@@ -232,6 +236,48 @@ namespace FoxProToMySqlMigrator.Services
             }));
 
             return splitResult;
+        }
+
+        private void RepairInvalidDateValues(
+            List<DbfColumnInfo> schema,
+            List<object?[]> rows,
+            BulkInsertResult result)
+        {
+            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+            {
+                var row = rows[rowIndex];
+                for (var columnIndex = 0; columnIndex < schema.Count && columnIndex < row.Length; columnIndex++)
+                {
+                    var column = schema[columnIndex];
+                    if (!IsDateColumn(column) || row[columnIndex] is not DateTime dateValue)
+                    {
+                        continue;
+                    }
+
+                    if (IsValidMySqlDate(dateValue))
+                    {
+                        continue;
+                    }
+
+                    row[columnIndex] = DBNull.Value;
+                    result.RepairedRows.Add(new BulkInsertRepairEvent
+                    {
+                        Index = rowIndex,
+                        Message = $"{column.OriginalName}: invalid MySQL date '{dateValue:yyyy-MM-dd HH:mm:ss}', inserted NULL before bulk insert",
+                        InsertedRow = row
+                    });
+                }
+            }
+        }
+
+        private bool IsDateColumn(DbfColumnInfo column)
+        {
+            return column.DbfFieldType == 'D' || column.DbfFieldType == 'T' || column.ColumnType == typeof(DateTime);
+        }
+
+        private bool IsValidMySqlDate(DateTime dateValue)
+        {
+            return dateValue.Year >= 1000 && dateValue.Year <= 9999;
         }
 
         private async Task<BulkInsertResult> TryInsertCorruptedRowAsync(

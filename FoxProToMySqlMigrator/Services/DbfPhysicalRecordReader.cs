@@ -9,6 +9,7 @@ namespace FoxProToMySqlMigrator.Services
         public long RecordNumber { get; init; }
         public bool IsDeleted { get; init; }
         public object?[] Values { get; init; } = Array.Empty<object?>();
+        public DbfRawFieldValue?[] RawFields { get; init; } = Array.Empty<DbfRawFieldValue?>();
         public int Marker { get; init; }
     }
 
@@ -73,14 +74,21 @@ namespace FoxProToMySqlMigrator.Services
                     RecordNumber = recordNumber,
                     Marker = marker,
                     IsDeleted = marker == 0x2A,
-                    Values = ParseValues(recordBuffer, schema)
+                    Values = ParseValues(recordBuffer, schema, recordNumber, offset, out var rawFields),
+                    RawFields = rawFields
                 };
             }
         }
 
-        private object?[] ParseValues(byte[] recordBuffer, List<DbfColumnInfo> schema)
+        private object?[] ParseValues(
+            byte[] recordBuffer,
+            List<DbfColumnInfo> schema,
+            long recordNumber,
+            long recordOffset,
+            out DbfRawFieldValue?[] rawFields)
         {
             var values = new object?[schema.Count];
+            rawFields = new DbfRawFieldValue?[schema.Count];
             var offset = 1;
 
             for (var i = 0; i < schema.Count; i++)
@@ -95,6 +103,16 @@ namespace FoxProToMySqlMigrator.Services
 
                 var rawBytes = new byte[length];
                 Buffer.BlockCopy(recordBuffer, offset, rawBytes, 0, length);
+                rawFields[i] = new DbfRawFieldValue
+                {
+                    RecordNumber = recordNumber,
+                    ColumnName = column.OriginalName,
+                    FieldType = column.DbfFieldType,
+                    Length = length,
+                    Offset = recordOffset + offset,
+                    Bytes = rawBytes,
+                    Text = _encoding.GetString(rawBytes).Replace("\0", "").Trim()
+                };
                 offset += length;
 
                 values[i] = DecodeRawField(column, rawBytes);
@@ -177,6 +195,12 @@ namespace FoxProToMySqlMigrator.Services
         {
             try
             {
+                if (year < 1000 || year > 9999)
+                {
+                    dateValue = default;
+                    return false;
+                }
+
                 dateValue = new DateTime(year, month, day);
                 return true;
             }

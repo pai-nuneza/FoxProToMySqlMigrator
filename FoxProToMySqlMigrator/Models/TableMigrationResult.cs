@@ -5,6 +5,7 @@ namespace FoxProToMySqlMigrator.Models
         public required string TableName { get; set; }
         public long RowCount { get; set; }
         public long ErrorCount { get; set; }
+        public long WarningCount { get; set; }
         public long TotalRecords { get; set; }
         public long ReadCount { get; set; }
         public long InsertedCount { get; set; }

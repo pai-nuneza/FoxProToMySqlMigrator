@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Windows;
 using System.ComponentModel;
@@ -36,8 +37,16 @@ namespace FoxProToMySqlMigrator
             _migrationService.LogMessage += OnLogMessage;
             _migrationService.TableCompleted += OnTableCompleted;
             
+            SetApplicationVersion();
             LoadDefaultSettings();
             SetupWatchdog();
+        }
+
+        private void SetApplicationVersion()
+        {
+            var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0.0";
+            TxtAppVersion.Text = $"v{version}";
+            Title = $"FoxPro to MySQL Migrator v{version}";
         }
 
         private void SetupWatchdog()
@@ -120,8 +129,10 @@ namespace FoxProToMySqlMigrator
             if (checkpoint != null)
             {
                 _currentCheckpoint = checkpoint;
-                TxtCheckpointMessage.Text = $"Found incomplete migration: {checkpoint.CompletedTables.Count} of {checkpoint.TotalTables} tables completed. " +
-                                           $"Started: {checkpoint.StartTime:yyyy-MM-dd HH:mm:ss}";
+                var failedCount = checkpoint.FailedTables?.Count ?? 0;
+                TxtCheckpointMessage.Text = $"Found incomplete migration: {checkpoint.CompletedTables.Count} of {checkpoint.TotalTables} tables completed" +
+                                           (failedCount > 0 ? $", {failedCount} failed/skipped" : "") +
+                                           $". Started: {checkpoint.StartTime:yyyy-MM-dd HH:mm:ss}";
                 CheckpointNotification.Visibility = Visibility.Visible;
             }
             else
@@ -186,6 +197,7 @@ namespace FoxProToMySqlMigrator
             var result = MessageBox.Show(
                 $"Resume migration from checkpoint?\n\n" +
                 $"Already completed: {_currentCheckpoint.CompletedTables.Count}/{_currentCheckpoint.TotalTables} tables\n" +
+                $"Failed/skipped: {_currentCheckpoint.FailedTables?.Count ?? 0}\n" +
                 $"Started: {_currentCheckpoint.StartTime:yyyy-MM-dd HH:mm:ss}\n\n" +
                 $"This will continue from where the migration was stopped.",
                 "Resume Migration",
@@ -240,6 +252,7 @@ namespace FoxProToMySqlMigrator
                 var result = MessageBox.Show(
                     $"Found an incomplete migration:\n\n" +
                     $"Already completed: {_currentCheckpoint.CompletedTables.Count}/{_currentCheckpoint.TotalTables} tables\n" +
+                    $"Failed/skipped: {_currentCheckpoint.FailedTables?.Count ?? 0}\n" +
                     $"Started: {_currentCheckpoint.StartTime:yyyy-MM-dd HH:mm:ss}\n\n" +
                     $"Do you want to:\n" +
                     $"• YES - Resume from checkpoint\n" +
@@ -566,7 +579,7 @@ namespace FoxProToMySqlMigrator
                     LstLog.Items.Add(logItem);
                 }
 
-                if (LstLog.Items.Count > 0)
+                if (ChkFollowLog.IsChecked == true && LstLog.Items.Count > 0)
                 {
                     LstLog.ScrollIntoView(LstLog.Items[LstLog.Items.Count - 1]);
                 }
@@ -610,7 +623,7 @@ namespace FoxProToMySqlMigrator
         {
             Dispatcher.Invoke(() =>
             {
-                var statusIcon = result.ErrorCount > 0 ? "⚠️" : "✓";
+                var statusIcon = result.ErrorCount > 0 ? "✗" : result.WarningCount > 0 ? "⚠️" : "✓";
                 
                 var summaryText = $"{statusIcon} {result.TableName}";
                 
@@ -630,6 +643,9 @@ namespace FoxProToMySqlMigrator
                 
                 if (result.ErrorCount > 0)
                     summaryText += $"\n   Errors: {result.ErrorCount}";
+
+                if (result.WarningCount > 0)
+                    summaryText += $"\n   Warnings: {result.WarningCount}";
                 
                 summaryText += "\n";
 
@@ -652,6 +668,7 @@ namespace FoxProToMySqlMigrator
                 "Match" => $"MATCH ({result.RowCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
                 "Accounted" => $"ACCOUNTED ({result.AccountedCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
                 "Mismatch" => $"MISMATCH missing {result.MissingCount:N0} ({result.AccountedCount:N0}/{result.DbfTotalCount.GetValueOrDefault():N0})",
+                "SkippedExisting" => "SKIPPED existing MySQL table",
                 _ => "unknown"
             };
         }
@@ -663,14 +680,19 @@ namespace FoxProToMySqlMigrator
                 return new SolidColorBrush(Color.FromRgb(30, 215, 96));
             }
 
-            if (result.CountStatus == "Mismatch")
+            if (result.ErrorCount > 0 || result.CountStatus == "Mismatch")
             {
                 return new SolidColorBrush(Color.FromRgb(255, 91, 95));
             }
 
-            if (result.CountStatus == "Accounted" || result.ErrorCount > 0)
+            if (result.CountStatus == "Accounted" || result.WarningCount > 0)
             {
                 return new SolidColorBrush(Color.FromRgb(255, 200, 87));
+            }
+
+            if (result.CountStatus == "SkippedExisting")
+            {
+                return new SolidColorBrush(Color.FromRgb(167, 167, 167));
             }
 
             return new SolidColorBrush(Color.FromRgb(231, 231, 231));

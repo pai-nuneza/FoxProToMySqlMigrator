@@ -21,6 +21,20 @@ namespace FoxProToMySqlMigrator.Services
             await createDbCmd.ExecuteNonQueryAsync(cancellationToken);
         }
 
+        public async Task<bool> TableExistsAsync(
+            MySqlConnection connection,
+            string tableName,
+            CancellationToken cancellationToken = default)
+        {
+            using var cmd = new MySqlCommand(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND LOWER(TABLE_NAME) = LOWER(@tableName)",
+                connection);
+            cmd.Parameters.AddWithValue("@tableName", tableName);
+
+            var result = await cmd.ExecuteScalarAsync(cancellationToken);
+            return Convert.ToInt64(result ?? 0) > 0;
+        }
+
         public async Task CreateTableAsync(
             MySqlConnection connection, 
             string tableName, 
@@ -36,6 +50,7 @@ namespace FoxProToMySqlMigrator.Services
             var createCmd = new MySqlCommand(createTableSql, connection);
             await createCmd.ExecuteNonQueryAsync(cancellationToken);
 
+            await EnsureMigrationRemarksColumnAsync(connection, tableName, cancellationToken);
             await WidenTextColumnsAsync(connection, tableName, schema, cancellationToken);
 
             // For FullReload mode, do NOT DROP the table. Instead TRUNCATE it to remove existing rows
@@ -46,6 +61,15 @@ namespace FoxProToMySqlMigrator.Services
                 await truncateCmd.ExecuteNonQueryAsync(cancellationToken);
                 await SynchronizeColumnTypesAsync(connection, tableName, schema, safeMode, cancellationToken);
             }
+        }
+
+        public async Task DropTableIfExistsAsync(
+            MySqlConnection connection,
+            string tableName,
+            CancellationToken cancellationToken = default)
+        {
+            var dropCmd = new MySqlCommand($"DROP TABLE IF EXISTS `{tableName}`", connection);
+            await dropCmd.ExecuteNonQueryAsync(cancellationToken);
         }
 
         private async Task WidenTextColumnsAsync(
@@ -128,11 +152,29 @@ namespace FoxProToMySqlMigrator.Services
             
             // Add is_deleted column for DBF deletion flag
             columnDefs.Add("`is_deleted` BOOLEAN DEFAULT FALSE");
+
+            columnDefs.Add("`migration_remarks` LONGTEXT NULL");
             
             // Add index on is_deleted for faster queries
             columnDefs.Add("INDEX `idx_is_deleted` (`is_deleted`)");
 
             return columnDefs;
+        }
+
+        private async Task EnsureMigrationRemarksColumnAsync(
+            MySqlConnection connection,
+            string tableName,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` ADD COLUMN `migration_remarks` LONGTEXT NULL", connection);
+                await alterCmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (MySqlException ex) when (ex.Number == 1060)
+            {
+                // Column already exists.
+            }
         }
     }
 }

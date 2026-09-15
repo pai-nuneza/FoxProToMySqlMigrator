@@ -117,6 +117,31 @@ namespace FoxProToMySqlMigrator.Services
             return columns;
         }
 
+        public List<DbfColumnInfo> GetTableSchemaFromHeader(string dbfFilePath)
+        {
+            var headerFields = ReadHeaderFieldInfo(dbfFilePath);
+            var columns = new List<DbfColumnInfo>();
+            var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (var i = 0; i < headerFields.Count; i++)
+            {
+                var field = headerFields[i];
+                var columnName = MakeSafeColumnName(field.Name, i, usedNames);
+                columns.Add(new DbfColumnInfo
+                {
+                    Name = columnName,
+                    OriginalName = field.Name,
+                    ColumnType = GetColumnType(field.Type),
+                    Index = i,
+                    DbfFieldType = field.Type,
+                    Length = field.Length,
+                    DecimalCount = field.DecimalCount
+                });
+            }
+
+            return columns;
+        }
+
         private sealed class DbfHeaderFieldInfo
         {
             public string Name { get; init; } = "";
@@ -174,6 +199,47 @@ namespace FoxProToMySqlMigrator.Services
             }
 
             return fields;
+        }
+
+        private static string MakeSafeColumnName(string originalName, int index, HashSet<string> usedNames)
+        {
+            var cleaned = new string(originalName
+                .Trim()
+                .ToLowerInvariant()
+                .Select(ch => char.IsLetterOrDigit(ch) || ch == '_' ? ch : '_')
+                .ToArray());
+
+            if (string.IsNullOrWhiteSpace(cleaned))
+            {
+                cleaned = $"field_{index + 1}";
+            }
+
+            if (char.IsDigit(cleaned[0]))
+            {
+                cleaned = "_" + cleaned;
+            }
+
+            var unique = cleaned;
+            var suffix = 2;
+            while (!usedNames.Add(unique))
+            {
+                unique = $"{cleaned}_{suffix++}";
+            }
+
+            return unique;
+        }
+
+        private static Type GetColumnType(char dbfFieldType)
+        {
+            return dbfFieldType switch
+            {
+                'D' or 'T' => typeof(DateTime),
+                'L' => typeof(bool),
+                'N' or 'F' or 'B' or 'O' or 'Y' => typeof(decimal),
+                'I' or '+' => typeof(int),
+                'G' or 'Q' or 'W' => typeof(byte[]),
+                _ => typeof(string)
+            };
         }
 
         public (DbfDataReader.DbfDataReader reader, FileStream? memoStream) OpenDbfFile(
