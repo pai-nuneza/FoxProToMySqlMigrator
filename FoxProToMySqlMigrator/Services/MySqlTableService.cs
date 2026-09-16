@@ -72,13 +72,84 @@ namespace FoxProToMySqlMigrator.Services
             await dropCmd.ExecuteNonQueryAsync(cancellationToken);
         }
 
+        public async Task<(int Updated, int Skipped)> UpdateTextColumnTypesSafelyAsync(
+            MySqlConnection connection,
+            string tableName,
+            List<DbfColumnInfo> schema,
+            bool safeMode,
+            Action<string>? log,
+            HashSet<string>? completedColumns = null,
+            Func<string, string, Task>? markColumnCompleteAsync = null,
+            CancellationToken cancellationToken = default)
+        {
+            var updated = 0;
+            var skipped = 0;
+
+            foreach (var column in schema.Where(IsTextOrMemoColumn))
+            {
+                var columnKey = GetColumnKey(tableName, column.Name);
+                if (completedColumns?.Contains(columnKey) == true)
+                {
+                    skipped++;
+                    log?.Invoke($"  - `{tableName}`.`{column.Name}` skipped: already completed in data type checkpoint.");
+                    continue;
+                }
+
+                var targetType = _typeMapper.MapToMySqlType(column, safeMode);
+                log?.Invoke($"  - `{tableName}`.`{column.Name}` checking target type {targetType}...");
+
+                if (!await ColumnExistsAsync(connection, tableName, column.Name, cancellationToken))
+                {
+                    skipped++;
+                    log?.Invoke($"  - `{tableName}`.`{column.Name}` skipped: column does not exist in MySQL.");
+                    if (markColumnCompleteAsync != null)
+                    {
+                        await markColumnCompleteAsync(tableName, column.Name);
+                    }
+                    continue;
+                }
+
+                if (targetType.StartsWith("VARCHAR(", StringComparison.OrdinalIgnoreCase) &&
+                    !await ExistingValuesFitVarcharAsync(connection, tableName, column.Name, column.Length, cancellationToken))
+                {
+                    skipped++;
+                    log?.Invoke($"  - `{tableName}`.`{column.Name}` skipped: existing values are longer than VARCHAR({column.Length}).");
+                    if (markColumnCompleteAsync != null)
+                    {
+                        await markColumnCompleteAsync(tableName, column.Name);
+                    }
+                    continue;
+                }
+
+                log?.Invoke($"  - `{tableName}`.`{column.Name}` applying ALTER COLUMN to {targetType}...");
+                var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` {targetType}", connection)
+                {
+                    CommandTimeout = 600
+                };
+                await alterCmd.ExecuteNonQueryAsync(cancellationToken);
+                updated++;
+                log?.Invoke($"  - `{tableName}`.`{column.Name}` updated to {targetType}.");
+                if (markColumnCompleteAsync != null)
+                {
+                    await markColumnCompleteAsync(tableName, column.Name);
+                }
+            }
+
+            return (updated, skipped);
+        }
+
+        private static string GetColumnKey(string tableName, string columnName)
+        {
+            return $"{tableName}.{columnName}".ToLowerInvariant();
+        }
+
         private async Task WidenTextColumnsAsync(
             MySqlConnection connection,
             string tableName,
             List<DbfColumnInfo> schema,
             CancellationToken cancellationToken)
         {
-            foreach (var column in schema.Where(IsTextColumn))
+            foreach (var column in schema.Where(IsMemoColumn))
             {
                 var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` LONGTEXT", connection);
                 await alterCmd.ExecuteNonQueryAsync(cancellationToken);
@@ -91,11 +162,16 @@ namespace FoxProToMySqlMigrator.Services
             }
         }
 
-        private bool IsTextColumn(DbfColumnInfo column)
+        private bool IsMemoColumn(DbfColumnInfo column)
+        {
+            return column.DbfFieldType == 'M';
+        }
+
+        private bool IsTextOrMemoColumn(DbfColumnInfo column)
         {
             return column.DbfFieldType == 'C'
-                || column.DbfFieldType == 'M'
                 || column.DbfFieldType == 'V'
+                || column.DbfFieldType == 'M'
                 || column.ColumnType == typeof(string);
         }
 
@@ -120,6 +196,41 @@ namespace FoxProToMySqlMigrator.Services
                 var alterCmd = new MySqlCommand($"ALTER TABLE `{tableName}` MODIFY COLUMN `{column.Name}` {mySqlType}", connection);
                 await alterCmd.ExecuteNonQueryAsync(cancellationToken);
             }
+        }
+
+        private async Task<bool> ColumnExistsAsync(
+            MySqlConnection connection,
+            string tableName,
+            string columnName,
+            CancellationToken cancellationToken)
+        {
+            using var cmd = new MySqlCommand(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND LOWER(TABLE_NAME) = LOWER(@tableName) AND LOWER(COLUMN_NAME) = LOWER(@columnName)",
+                connection);
+            cmd.Parameters.AddWithValue("@tableName", tableName);
+            cmd.Parameters.AddWithValue("@columnName", columnName);
+
+            var result = await cmd.ExecuteScalarAsync(cancellationToken);
+            return Convert.ToInt64(result ?? 0) > 0;
+        }
+
+        private async Task<bool> ExistingValuesFitVarcharAsync(
+            MySqlConnection connection,
+            string tableName,
+            string columnName,
+            int varcharLength,
+            CancellationToken cancellationToken)
+        {
+            if (varcharLength <= 0)
+            {
+                varcharLength = 255;
+            }
+
+            using var cmd = new MySqlCommand($"SELECT COALESCE(MAX(CHAR_LENGTH(`{columnName}`)), 0) FROM `{tableName}`", connection);
+            cmd.CommandTimeout = 600;
+            var result = await cmd.ExecuteScalarAsync(cancellationToken);
+            var maxLength = Convert.ToInt64(result ?? 0);
+            return maxLength <= varcharLength;
         }
 
         private async Task CreateTableInternalAsync(

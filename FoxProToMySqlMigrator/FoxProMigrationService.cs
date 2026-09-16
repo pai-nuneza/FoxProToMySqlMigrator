@@ -1,6 +1,7 @@
 ﻿using System.IO;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using MySql.Data.MySqlClient;
 using FoxProToMySqlMigrator.Models;
 using FoxProToMySqlMigrator.Services;
@@ -80,12 +81,175 @@ namespace FoxProToMySqlMigrator
             public long EstimatedBatchBytes { get; init; }
         }
 
+        private sealed class DataTypeUpdateCheckpoint
+        {
+            public string FoxProFolder { get; set; } = "";
+            public string TargetDatabase { get; set; } = "";
+            public DateTime StartTime { get; set; }
+            public DateTime LastUpdateTime { get; set; }
+            public List<string> CompletedTables { get; set; } = new();
+            public List<string> CompletedColumns { get; set; } = new();
+            public bool IsCompleted { get; set; }
+        }
+
+        private sealed class TableAllowlistResult
+        {
+            public string[] IncludedFiles { get; init; } = Array.Empty<string>();
+            public List<string> SkippedTables { get; init; } = new();
+        }
+
         public async Task<MigrationCheckpoint?> LoadCheckpointAsync(string foxProFolder, string targetDatabase)
         {
             var checkpointFile = Path.Combine(AppSettings.LogsFolder, $"checkpoint_{targetDatabase}.json");
             
             var checkpointService = new CheckpointService(checkpointFile);
             return await checkpointService.LoadCheckpointAsync(foxProFolder, targetDatabase);
+        }
+
+        public async Task UpdateExistingTableDataTypesAsync(
+            string foxProFolder,
+            string mySqlConnectionString,
+            string targetDatabase,
+            bool safeMode,
+            IReadOnlyCollection<string>? tableFilter = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (!Directory.Exists(foxProFolder))
+            {
+                throw new DirectoryNotFoundException($"FoxPro folder not found: {foxProFolder}");
+            }
+
+            var allDbfFiles = Directory.GetFiles(foxProFolder, "*.dbf");
+            var allowlistResult = ApplyTableAllowlist(allDbfFiles, tableFilter);
+            var dbfFiles = allowlistResult.IncludedFiles;
+            if (dbfFiles.Length == 0)
+            {
+                throw new FileNotFoundException(tableFilter?.Count > 0
+                    ? "None of the selected tables were found as DBF files in the selected folder"
+                    : "No DBF files found in the selected folder");
+            }
+
+            LogMessage?.Invoke($"Starting safe data type update for {dbfFiles.Length:N0} DBF table(s).");
+            if (allowlistResult.SkippedTables.Count > 0)
+            {
+                LogMessage?.Invoke($"Skipped {allowlistResult.SkippedTables.Count:N0} DBF table(s) not in needed-tables.json.");
+            }
+            LogMessage?.Invoke("Only existing MySQL text/memo columns are updated. VARCHAR shrink is skipped when existing data is too long.");
+
+            var updateLogsFolder = Path.Combine(AppSettings.LogsFolder, $"datatype_update_{DateTime.Now:yyyyMMdd_HHmmss}");
+            Directory.CreateDirectory(updateLogsFolder);
+            var statusLogPath = Path.Combine(updateLogsFolder, "datatype_update_status.txt");
+            var checkpointPath = Path.Combine(AppSettings.LogsFolder, $"datatype_update_checkpoint_{targetDatabase}.json");
+            var checkpoint = LoadDataTypeUpdateCheckpoint(checkpointPath, foxProFolder, targetDatabase)
+                ?? new DataTypeUpdateCheckpoint
+                {
+                    FoxProFolder = foxProFolder,
+                    TargetDatabase = targetDatabase,
+                    StartTime = DateTime.Now,
+                    LastUpdateTime = DateTime.Now,
+                    CompletedTables = new List<string>(),
+                    CompletedColumns = new List<string>(),
+                    IsCompleted = false
+                };
+            var completedColumns = new HashSet<string>(checkpoint.CompletedColumns, StringComparer.OrdinalIgnoreCase);
+            var completedTables = new HashSet<string>(checkpoint.CompletedTables, StringComparer.OrdinalIgnoreCase);
+
+            WriteDataTypeUpdateStatus(statusLogPath, "START", "", "", $"Safe data type update started. DBF tables={dbfFiles.Length:N0}, database={targetDatabase}");
+            LogMessage?.Invoke($"Data type update status log: {statusLogPath}");
+            LogMessage?.Invoke($"Data type update checkpoint: {checkpointPath}");
+            if (completedColumns.Count > 0)
+            {
+                LogMessage?.Invoke($"Resuming data type update checkpoint with {completedColumns.Count:N0} completed column(s).");
+            }
+            if (completedTables.Count > 0)
+            {
+                LogMessage?.Invoke($"Data type update will skip {completedTables.Count:N0} already completed table(s).");
+            }
+            await SaveDataTypeUpdateCheckpointAsync(checkpointPath, checkpoint);
+
+            using var mySqlConn = new MySqlConnection(mySqlConnectionString);
+            await mySqlConn.OpenAsync(cancellationToken);
+
+            var tableService = new MySqlTableService();
+            await tableService.EnsureDatabaseExistsAsync(mySqlConn, targetDatabase, cancellationToken);
+            mySqlConn.ChangeDatabase(targetDatabase);
+
+            var schemaReader = new DbfSchemaReader();
+            var totalUpdated = 0;
+            var totalSkipped = 0;
+            var totalMissingTables = 0;
+
+            foreach (var dbfFile in dbfFiles)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var tableName = Path.GetFileNameWithoutExtension(dbfFile).ToLower();
+                if (completedTables.Contains(tableName))
+                {
+                    LogMessage?.Invoke($"[{tableName}] skipped: already completed in data type checkpoint.");
+                    WriteDataTypeUpdateStatus(statusLogPath, "SKIP_TABLE_COMPLETED", tableName, "", "Already completed in data type checkpoint.");
+                    continue;
+                }
+
+                WriteDataTypeUpdateStatus(statusLogPath, "TABLE_START", tableName, "", dbfFile);
+                if (!await tableService.TableExistsAsync(mySqlConn, tableName, cancellationToken))
+                {
+                    totalMissingTables++;
+                    LogMessage?.Invoke($"[{tableName}] skipped: MySQL table does not exist.");
+                    WriteDataTypeUpdateStatus(statusLogPath, "SKIP_TABLE_MISSING", tableName, "", "MySQL table does not exist.");
+                    continue;
+                }
+
+                var schema = ReadSchemaForTypeUpdate(schemaReader, dbfFile, tableName);
+                if (schema.Count == 0)
+                {
+                    totalSkipped++;
+                    LogMessage?.Invoke($"[{tableName}] skipped: could not read DBF schema.");
+                    WriteDataTypeUpdateStatus(statusLogPath, "SKIP_SCHEMA", tableName, "", "Could not read DBF schema.");
+                    continue;
+                }
+
+                LogMessage?.Invoke($"[{tableName}] checking {schema.Count:N0} DBF column(s)...");
+                var result = await tableService.UpdateTextColumnTypesSafelyAsync(
+                    mySqlConn,
+                    tableName,
+                    schema,
+                    safeMode,
+                    msg =>
+                    {
+                        LogMessage?.Invoke(msg);
+                        WriteDataTypeUpdateStatus(statusLogPath, "COLUMN_PROGRESS", tableName, "", msg.Trim());
+                    },
+                    completedColumns,
+                    async (completedTable, completedColumn) =>
+                    {
+                        var columnKey = GetDataTypeUpdateColumnKey(completedTable, completedColumn);
+                        if (completedColumns.Add(columnKey))
+                        {
+                            checkpoint.CompletedColumns = completedColumns.OrderBy(c => c).ToList();
+                            checkpoint.LastUpdateTime = DateTime.Now;
+                            await SaveDataTypeUpdateCheckpointAsync(checkpointPath, checkpoint);
+                            WriteDataTypeUpdateStatus(statusLogPath, "COLUMN_CHECKPOINT", completedTable, completedColumn, "Progress saved.");
+                        }
+                    },
+                    cancellationToken);
+
+                totalUpdated += result.Updated;
+                totalSkipped += result.Skipped;
+                LogMessage?.Invoke($"[{tableName}] data type update complete. Updated={result.Updated:N0}, Skipped={result.Skipped:N0}.");
+                completedTables.Add(tableName);
+                checkpoint.CompletedTables = completedTables.OrderBy(t => t).ToList();
+                checkpoint.CompletedColumns = completedColumns.OrderBy(c => c).ToList();
+                checkpoint.LastUpdateTime = DateTime.Now;
+                await SaveDataTypeUpdateCheckpointAsync(checkpointPath, checkpoint);
+                WriteDataTypeUpdateStatus(statusLogPath, "TABLE_DONE", tableName, "", $"Updated={result.Updated:N0}, Skipped={result.Skipped:N0}");
+            }
+
+            LogMessage?.Invoke($"Safe data type update finished. Columns updated={totalUpdated:N0}, skipped={totalSkipped:N0}, missing tables={totalMissingTables:N0}.");
+            checkpoint.IsCompleted = true;
+            checkpoint.LastUpdateTime = DateTime.Now;
+            await SaveDataTypeUpdateCheckpointAsync(checkpointPath, checkpoint);
+            WriteDataTypeUpdateStatus(statusLogPath, "DONE", "", "", $"Columns updated={totalUpdated:N0}, skipped={totalSkipped:N0}, missing tables={totalMissingTables:N0}");
         }
 
         public async Task MigrateAsync(
@@ -95,6 +259,7 @@ namespace FoxProToMySqlMigrator
             bool safeMode,
             MigrationMode migrationMode,
             int batchSize,
+            IReadOnlyCollection<string>? tableFilter = null,
             MigrationCheckpoint? resumeFromCheckpoint = null,
             CancellationToken cancellationToken = default)
         {
@@ -117,13 +282,19 @@ namespace FoxProToMySqlMigrator
                     throw new DirectoryNotFoundException($"FoxPro folder not found: {foxProFolder}");
                 }
 
-                var dbfFiles = Directory.GetFiles(foxProFolder, "*.dbf");
-                _logger.Log($"Found {dbfFiles.Length} DBF file(s)");
+                var allDbfFiles = Directory.GetFiles(foxProFolder, "*.dbf");
+                _logger.Log($"Found {allDbfFiles.Length} DBF file(s)");
+                var allowlistResult = ApplyTableAllowlist(allDbfFiles, tableFilter);
+                var dbfFiles = allowlistResult.IncludedFiles;
+                LogTableAllowlistSummary(allDbfFiles, allowlistResult, tableFilter);
 
                 if (dbfFiles.Length == 0)
                 {
-                    _logger.Log("No DBF files found in the selected folder");
-                    throw new FileNotFoundException("No DBF files found in the selected folder");
+                    var message = tableFilter?.Count > 0
+                        ? "None of the selected tables were found as DBF files in the selected folder"
+                        : "No DBF files found in the selected folder";
+                    _logger.Log(message);
+                    throw new FileNotFoundException(message);
                 }
 
                 // Initialize or restore checkpoint
@@ -235,6 +406,184 @@ namespace FoxProToMySqlMigrator
                 $"========================================{Environment.NewLine}{Environment.NewLine}");
 
             return (mainLogsFolder, checkpointFilePath);
+        }
+
+        private static TableAllowlistResult ApplyTableAllowlist(string[] dbfFiles, IReadOnlyCollection<string>? tableFilter)
+        {
+            if (tableFilter == null || tableFilter.Count == 0)
+            {
+                return new TableAllowlistResult
+                {
+                    IncludedFiles = dbfFiles
+                        .OrderBy(file => Path.GetFileNameWithoutExtension(file), StringComparer.OrdinalIgnoreCase)
+                        .ToArray()
+                };
+            }
+
+            var allowlist = new HashSet<string>(
+                tableFilter.Select(NormalizeTableName).Where(table => table.Length > 0),
+                StringComparer.OrdinalIgnoreCase);
+
+            if (allowlist.Count == 0)
+            {
+                return new TableAllowlistResult();
+            }
+
+            var includedFiles = new List<string>();
+            var skippedTables = new List<string>();
+
+            foreach (var dbfFile in dbfFiles.OrderBy(file => Path.GetFileNameWithoutExtension(file), StringComparer.OrdinalIgnoreCase))
+            {
+                var tableName = NormalizeTableName(Path.GetFileNameWithoutExtension(dbfFile));
+                if (allowlist.Contains(tableName))
+                {
+                    includedFiles.Add(dbfFile);
+                }
+                else
+                {
+                    skippedTables.Add(tableName);
+                }
+            }
+
+            return new TableAllowlistResult
+            {
+                IncludedFiles = includedFiles.ToArray(),
+                SkippedTables = skippedTables
+            };
+        }
+
+        private void LogTableAllowlistSummary(
+            string[] allDbfFiles,
+            TableAllowlistResult allowlistResult,
+            IReadOnlyCollection<string>? tableFilter)
+        {
+            if (tableFilter == null || tableFilter.Count == 0)
+            {
+                return;
+            }
+
+            var selectedTables = tableFilter
+                .Select(NormalizeTableName)
+                .Where(table => table.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(table => table)
+                .ToList();
+
+            var availableTables = allDbfFiles
+                .Select(file => NormalizeTableName(Path.GetFileNameWithoutExtension(file)))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var missingTables = selectedTables
+                .Where(table => !availableTables.Contains(table))
+                .ToList();
+
+            _logger!.Log($"Table allowlist enabled. Selected={selectedTables.Count:N0}, Will migrate={allowlistResult.IncludedFiles.Length:N0}, Skipped not allowed={allowlistResult.SkippedTables.Count:N0}, Missing={missingTables.Count:N0}.");
+            foreach (var skippedTable in allowlistResult.SkippedTables)
+            {
+                _logger.Log($"Skipping `{skippedTable}`: not in needed-tables.json allowlist.");
+                LogTableStatus(skippedTable, "SKIPPED_NOT_ALLOWLISTED", "", "DBF table is not listed in needed-tables.json.");
+            }
+
+            if (missingTables.Count > 0)
+            {
+                _logger.Log($"Selected tables not found in FoxPro folder: {string.Join(", ", missingTables)}");
+            }
+        }
+
+        private static string NormalizeTableName(string? tableName)
+        {
+            return (tableName ?? "")
+                .Trim()
+                .Trim('`', '"', '\'')
+                .ToLowerInvariant();
+        }
+
+        private List<DbfColumnInfo> ReadSchemaForTypeUpdate(
+            DbfSchemaReader schemaReader,
+            string dbfFilePath,
+            string tableName)
+        {
+            try
+            {
+                var (dbfReader, memoStream) = schemaReader.OpenDbfFile(dbfFilePath, out _, out _);
+                try
+                {
+                    return schemaReader.GetTableSchema(dbfReader, dbfFilePath);
+                }
+                finally
+                {
+                    dbfReader.Dispose();
+                    memoStream?.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage?.Invoke($"[{tableName}] DBF reader schema failed: {ex.Message}. Trying raw DBF header.");
+                return schemaReader.GetTableSchemaFromHeader(dbfFilePath);
+            }
+        }
+
+        private void WriteDataTypeUpdateStatus(
+            string statusLogPath,
+            string status,
+            string tableName,
+            string columnName,
+            string message)
+        {
+            try
+            {
+                var entry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{status}\t{tableName}\t{columnName}\t{message}{Environment.NewLine}";
+                File.AppendAllText(statusLogPath, entry);
+            }
+            catch
+            {
+                // The UI log still carries progress if the status file cannot be written.
+            }
+        }
+
+        private DataTypeUpdateCheckpoint? LoadDataTypeUpdateCheckpoint(
+            string checkpointPath,
+            string foxProFolder,
+            string targetDatabase)
+        {
+            try
+            {
+                if (!File.Exists(checkpointPath))
+                {
+                    return null;
+                }
+
+                var json = File.ReadAllText(checkpointPath);
+                var checkpoint = JsonSerializer.Deserialize<DataTypeUpdateCheckpoint>(json);
+                if (checkpoint == null ||
+                    !string.Equals(checkpoint.FoxProFolder, foxProFolder, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(checkpoint.TargetDatabase, targetDatabase, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+
+                checkpoint.CompletedTables ??= new List<string>();
+                checkpoint.CompletedColumns ??= new List<string>();
+                return checkpoint;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private async Task SaveDataTypeUpdateCheckpointAsync(
+            string checkpointPath,
+            DataTypeUpdateCheckpoint checkpoint)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(checkpointPath) ?? AppSettings.LogsFolder);
+            var json = JsonSerializer.Serialize(checkpoint, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(checkpointPath, json);
+        }
+
+        private static string GetDataTypeUpdateColumnKey(string tableName, string columnName)
+        {
+            return $"{tableName}.{columnName}".ToLowerInvariant();
         }
 
         private async Task ConfigureStrictMySqlSessionAsync(

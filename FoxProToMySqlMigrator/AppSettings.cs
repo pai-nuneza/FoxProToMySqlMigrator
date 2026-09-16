@@ -20,7 +20,9 @@ namespace FoxProToMySqlMigrator
         // Safe Mode ON by default - prioritizes preserving rows and avoids string truncation
         public const bool DefaultSafeMode = true;
 
-        public static string AppDataFolder => Path.Combine(
+        public static string AppDataFolder => Path.Combine(AppContext.BaseDirectory, "Data");
+
+        public static string LegacyAppDataFolder => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "FoxProToMySqlMigrator");
 
@@ -35,6 +37,7 @@ namespace FoxProToMySqlMigrator
         public string TargetDatabase { get; set; } = AppSettings.DefaultDatabaseName;
         public string FoxProFolder { get; set; } = AppSettings.DefaultFoxProFolder;
         public int BatchSize { get; set; } = 1000;
+        public bool TableFilterEnabled { get; set; } = true;
     }
 
     public static class UserAppConfigStore
@@ -48,6 +51,8 @@ namespace FoxProToMySqlMigrator
         {
             try
             {
+                CopyLegacyConfigIfNeeded();
+
                 if (!File.Exists(AppSettings.ConfigFilePath))
                 {
                     return new UserAppConfig();
@@ -69,6 +74,23 @@ namespace FoxProToMySqlMigrator
 
             var json = JsonSerializer.Serialize(config, JsonOptions);
             File.WriteAllText(AppSettings.ConfigFilePath, json);
+        }
+
+        private static void CopyLegacyConfigIfNeeded()
+        {
+            if (File.Exists(AppSettings.ConfigFilePath))
+            {
+                return;
+            }
+
+            var legacyConfigPath = Path.Combine(AppSettings.LegacyAppDataFolder, "config.json");
+            if (!File.Exists(legacyConfigPath))
+            {
+                return;
+            }
+
+            Directory.CreateDirectory(AppSettings.AppDataFolder);
+            File.Copy(legacyConfigPath, AppSettings.ConfigFilePath, overwrite: false);
         }
     }
 }

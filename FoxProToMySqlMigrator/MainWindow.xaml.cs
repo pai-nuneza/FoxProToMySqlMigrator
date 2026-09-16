@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Text.Json;
 using System.Threading;
 using System.Windows;
 using System.ComponentModel;
@@ -29,6 +30,13 @@ namespace FoxProToMySqlMigrator
         private bool _shouldRetryRequested = false;
         private System.Windows.Controls.ListBoxItem? _currentBatchLogItem;
         private bool _settingsLoaded;
+        private List<string> _neededTables = new();
+        private bool _neededTablesFileLoaded;
+
+        private sealed class NeededTablesFile
+        {
+            public List<string> Tables { get; set; } = new();
+        }
 
         public MainWindow()
         {
@@ -39,12 +47,24 @@ namespace FoxProToMySqlMigrator
             
             SetApplicationVersion();
             LoadDefaultSettings();
+            LoadNeededTablesFromJson(showSuccessMessage: false);
             SetupWatchdog();
         }
 
         private void SetApplicationVersion()
         {
-            var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0.0";
+            var assembly = Assembly.GetExecutingAssembly();
+            var version = assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion
+                ?? assembly.GetName().Version?.ToString()
+                ?? "0.0.0.0";
+            var metadataIndex = version.IndexOf('+');
+            if (metadataIndex >= 0)
+            {
+                version = version[..metadataIndex];
+            }
+
             TxtAppVersion.Text = $"v{version}";
             Title = $"FoxPro to MySQL Migrator v{version}";
         }
@@ -92,6 +112,7 @@ namespace FoxProToMySqlMigrator
             TxtDatabaseName.Text = config.TargetDatabase;
             TxtFoxProFolder.Text = config.FoxProFolder;
             TxtBatchSize.Text = config.BatchSize.ToString();
+            ChkOnlySelectedTables.IsChecked = config.TableFilterEnabled;
             _settingsLoaded = true;
         }
 
@@ -107,10 +128,144 @@ namespace FoxProToMySqlMigrator
                 MySqlServer = TxtMySqlServer.Text,
                 TargetDatabase = TxtDatabaseName.Text,
                 FoxProFolder = TxtFoxProFolder.Text,
-                BatchSize = int.TryParse(TxtBatchSize.Text, out var batchSize) ? batchSize : 1000
+                BatchSize = int.TryParse(TxtBatchSize.Text, out var batchSize) ? batchSize : 1000,
+                TableFilterEnabled = ChkOnlySelectedTables.IsChecked == true
             };
 
             UserAppConfigStore.Save(config);
+        }
+
+        private IReadOnlyCollection<string>? GetActiveTableFilter()
+        {
+            if (ChkOnlySelectedTables.IsChecked != true || !_neededTablesFileLoaded)
+            {
+                return null;
+            }
+
+            return _neededTables;
+        }
+
+        private void UpdateSelectedTableCount()
+        {
+            if (TxtSelectedTableCount == null)
+            {
+                return;
+            }
+
+            var count = _neededTables.Count;
+            if (!_neededTablesFileLoaded)
+            {
+                TxtSelectedTableCount.Text = "Allowlist file missing; all DBF tables will be migrated";
+            }
+            else
+            {
+                TxtSelectedTableCount.Text = count == 1
+                    ? "1 table selected"
+                    : $"{count:N0} tables selected";
+            }
+        }
+
+        private void LoadNeededTablesFromJson(bool showSuccessMessage)
+        {
+            try
+            {
+                var path = GetNeededTablesJsonPath();
+                if (!File.Exists(path))
+                {
+                    _neededTablesFileLoaded = false;
+                    _neededTables = new List<string>();
+                    LstNeededTables.ItemsSource = _neededTables;
+                    UpdateSelectedTableCount();
+
+                    if (showSuccessMessage)
+                    {
+                        MessageBox.Show("needed-tables.json was not found. The allowlist is disabled, so all DBF tables will be migrated.", "Reload JSON", MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
+
+                    return;
+                }
+
+                var json = ReadNeededTablesJson(path);
+                var tableFile = JsonSerializer.Deserialize<NeededTablesFile>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                _neededTables = (tableFile?.Tables ?? new List<string>())
+                    .Select(table => table.Trim().Trim('`', '"', '\'').ToLowerInvariant())
+                    .Where(table => !string.IsNullOrWhiteSpace(table))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(table => table)
+                    .ToList();
+
+                _neededTablesFileLoaded = true;
+                LstNeededTables.ItemsSource = _neededTables;
+                UpdateSelectedTableCount();
+
+                if (showSuccessMessage)
+                {
+                    MessageBox.Show($"Loaded {_neededTables.Count:N0} table(s) from needed-tables.json.", "Reload JSON", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                _neededTablesFileLoaded = false;
+                _neededTables = new List<string>();
+                LstNeededTables.ItemsSource = _neededTables;
+                UpdateSelectedTableCount();
+                MessageBox.Show($"Could not load needed-tables.json.\n\n{ex.Message}", "Table Inventory", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private static string GetNeededTablesJsonPath()
+        {
+            return Path.Combine(AppSettings.AppDataFolder, "needed-tables.json");
+        }
+
+        private static string ReadNeededTablesJson(string path)
+        {
+            if (!File.Exists(path))
+            {
+                throw new FileNotFoundException("needed-tables.json was not found.", path);
+            }
+
+            return File.ReadAllText(path);
+        }
+
+        private void BtnReloadNeededTables_Click(object sender, RoutedEventArgs e)
+        {
+            LoadNeededTablesFromJson(showSuccessMessage: true);
+        }
+
+        private void BtnOpenNeededTablesJson_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                Directory.CreateDirectory(AppSettings.AppDataFolder);
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = File.Exists(GetNeededTablesJsonPath())
+                        ? GetNeededTablesJsonPath()
+                        : AppSettings.AppDataFolder,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not open needed-tables.json.\n\n{ex.Message}", "Open JSON", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void TableFilterSettings_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!_settingsLoaded)
+            {
+                return;
+            }
+
+            UpdateSelectedTableCount();
+            SaveCurrentSettings();
         }
 
         private async void CheckForExistingCheckpoint()
@@ -246,6 +401,13 @@ namespace FoxProToMySqlMigrator
                 return;
             }
 
+            var selectedTables = GetActiveTableFilter();
+            if (selectedTables != null && selectedTables.Count == 0)
+            {
+                MessageBox.Show("The table filter is enabled, but no tables are listed. Add table names or turn off the filter.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             // Check if there's an existing checkpoint and ask user
             if (_currentCheckpoint != null)
             {
@@ -298,6 +460,7 @@ namespace FoxProToMySqlMigrator
                 
                 // Update UI
                 BtnMigrate.IsEnabled = false;
+                BtnUpdateTypes.IsEnabled = false;
                 BtnStop.Visibility = Visibility.Visible;
                 CheckpointNotification.Visibility = Visibility.Collapsed;
                 StartSpinner();
@@ -317,6 +480,7 @@ namespace FoxProToMySqlMigrator
                     true,
                     migrationMode,
                     batchSize,
+                    GetActiveTableFilter(),
                     resumeFromCheckpoint,
                     _cancellationTokenSource.Token
                 );
@@ -414,6 +578,7 @@ namespace FoxProToMySqlMigrator
                 
                 // Restore UI
                 BtnMigrate.IsEnabled = true;
+                BtnUpdateTypes.IsEnabled = true;
                 BtnStop.Visibility = Visibility.Collapsed;
                 BtnStop.IsEnabled = true;
                 StopSpinner();
@@ -426,6 +591,109 @@ namespace FoxProToMySqlMigrator
                 await Task.Delay(1500);
                 await StartMigrationAsync(checkpointToRetry);
             }
+        }
+
+        private async void BtnUpdateTypes_Click(object sender, RoutedEventArgs e)
+        {
+            if (_isMigrating)
+            {
+                MessageBox.Show("A migration or update is already in progress.", "Please Wait", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            if (!ValidateConnectionInputs())
+            {
+                return;
+            }
+
+            var selectedTables = GetActiveTableFilter();
+            if (selectedTables != null && selectedTables.Count == 0)
+            {
+                MessageBox.Show("The table filter is enabled, but needed-tables.json did not load any tables.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var result = MessageBox.Show(
+                "Update existing MySQL text column types from the DBF schema?\n\n" +
+                "This will only change existing tables. It will shrink LONGTEXT/TEXT to VARCHAR only when current MySQL values fit the DBF field length. Unsafe columns are skipped and logged.",
+                "Update Data Types",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (result != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            SaveCurrentSettings();
+
+            try
+            {
+                _isMigrating = true;
+                _lastLogUpdate = DateTime.Now;
+                _frozenAlertShown = false;
+                _cancellationTokenSource = new CancellationTokenSource();
+
+                BtnMigrate.IsEnabled = false;
+                BtnUpdateTypes.IsEnabled = false;
+                BtnStop.Visibility = Visibility.Visible;
+                LoadingText.Text = "Updating data types...";
+                StartSpinner();
+
+                var connectionString = TxtMySqlServer.Text.TrimEnd(';') + $";Database={TxtDatabaseName.Text};";
+                await _migrationService.UpdateExistingTableDataTypesAsync(
+                    TxtFoxProFolder.Text,
+                    connectionString,
+                    TxtDatabaseName.Text,
+                    true,
+                    GetActiveTableFilter(),
+                    _cancellationTokenSource.Token);
+
+                MessageBox.Show("Data type update completed. Check the log for updated and skipped columns.", "Update Data Types", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (OperationCanceledException)
+            {
+                MessageBox.Show("Data type update was cancelled.", "Update Data Types", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not update data types.\n\n{ex.Message}", "Update Data Types", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                _isMigrating = false;
+                _cancellationTokenSource?.Dispose();
+                _cancellationTokenSource = null;
+
+                BtnMigrate.IsEnabled = true;
+                BtnUpdateTypes.IsEnabled = true;
+                BtnStop.Visibility = Visibility.Collapsed;
+                BtnStop.IsEnabled = true;
+                StopSpinner();
+            }
+        }
+
+        private bool ValidateConnectionInputs()
+        {
+            if (string.IsNullOrWhiteSpace(TxtFoxProFolder.Text))
+            {
+                MessageBox.Show("Please select a FoxPro folder.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(TxtMySqlServer.Text))
+            {
+                MessageBox.Show("Please enter MySQL server connection details.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(TxtDatabaseName.Text))
+            {
+                MessageBox.Show("Please enter a target database name.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
+            }
+
+            return true;
         }
 
         private void BtnStop_Click(object sender, RoutedEventArgs e)
@@ -459,20 +727,21 @@ namespace FoxProToMySqlMigrator
         {
             try
             {
-                var logsFolder = GetLogsFolder();
-                Directory.CreateDirectory(logsFolder);
+                var dataFolder = GetDataFolder();
+                Directory.CreateDirectory(dataFolder);
+                Directory.CreateDirectory(AppSettings.LogsFolder);
 
                 Process.Start(new ProcessStartInfo
                 {
-                    FileName = logsFolder,
+                    FileName = dataFolder,
                     UseShellExecute = true
                 });
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    $"Could not open the logs folder.\n\n{ex.Message}",
-                    "Open Logs Folder",
+                    $"Could not open the data folder.\n\n{ex.Message}",
+                    "Open Data Folder",
                     MessageBoxButton.OK,
                 MessageBoxImage.Error);
             }
@@ -545,9 +814,9 @@ namespace FoxProToMySqlMigrator
             Directory.CreateDirectory(logsFolder);
         }
 
-        private static string GetLogsFolder()
+        private static string GetDataFolder()
         {
-            return AppSettings.LogsFolder;
+            return AppSettings.AppDataFolder;
         }
 
         private void OnLogMessage(string message)

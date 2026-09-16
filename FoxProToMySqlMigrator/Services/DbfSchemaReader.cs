@@ -7,14 +7,6 @@ namespace FoxProToMySqlMigrator.Services
 {
     internal class DbfSchemaReader
     {
-        private static readonly string[] LargeTextColumnKeywords = new[]
-        {
-            "memo", "note", "comment", "description", "particular", 
-            "remarks", "detail", "content", "text", "message",
-            "body", "summary", "narrative", "observation", "review",
-            "address"  // Added address to large text fields
-        };
-
         public List<DbfColumnInfo> GetTableSchema(DbfDataReader.DbfDataReader reader, string? dbfFilePath = null)
         {
             var columns = new List<DbfColumnInfo>();
@@ -304,30 +296,7 @@ namespace FoxProToMySqlMigrator.Services
 
         public bool IsLargeTextField(DbfColumnInfo column)
         {
-            if (column.ColumnType != typeof(string))
-            {
-                return false;
-            }
-
-            var lowerName = column.Name.ToLower();
-            var lowerOriginalName = column.OriginalName.ToLower();
-
-            // Check if column name ends with _MEMO
-            if (lowerOriginalName.EndsWith("_memo"))
-            {
-                return true;
-            }
-
-            // Check if column name contains any of the large text keywords
-            foreach (var keyword in LargeTextColumnKeywords)
-            {
-                if (lowerName.Contains(keyword) || lowerOriginalName.Contains(keyword))
-                {
-                    return true;
-                }
-            }
-
-            return false;
+            return column.DbfFieldType == 'M';
         }
     }
 }

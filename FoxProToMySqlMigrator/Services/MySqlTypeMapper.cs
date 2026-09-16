@@ -4,15 +4,6 @@ namespace FoxProToMySqlMigrator.Services
 {
     internal class MySqlTypeMapper
     {
-        private static readonly string[] LargeTextColumnKeywords = new[]
-        {
-            "memo", "note", "notes",  "comment", "description", "particular", 
-            "remarks", "detail", "content", "text", "message",
-            "body", "summary", "narrative", "observation", "review",
-            "address",  // Added address to large text fields
-            "name"      // Treat name-like fields as large text to avoid truncation
-        };
-
         public string MapToMySqlType(DbfColumnInfo column, bool safeMode)
         {
             // Use native DBF field type for accurate mapping
@@ -89,33 +80,28 @@ namespace FoxProToMySqlMigrator.Services
                 
                 case 'C': // Character field
                 case 'V': // Varchar/varbinary-like text in Visual FoxPro
-                default:  // Default to character handling
-                    // Data integrity wins over compact schema. LONGTEXT is MySQL's largest text type.
-                    return "LONGTEXT";
+                    return MapCharacterType(column);
+
+                default:
+                    return column.ColumnType == typeof(string)
+                        ? MapCharacterType(column)
+                        : "LONGTEXT";
             }
         }
 
-        private bool IsLargeTextField(DbfColumnInfo column)
+        private string MapCharacterType(DbfColumnInfo column)
         {
-            var lowerName = column.Name.ToLower();
-            var lowerOriginalName = column.OriginalName.ToLower();
-
-            // Check if column name ends with _MEMO
-            if (lowerOriginalName.EndsWith("_memo"))
+            if (column.Length <= 0)
             {
-                return true;
+                return "VARCHAR(255)";
             }
 
-            // Check if column name contains any of the large text keywords
-            foreach (var keyword in LargeTextColumnKeywords)
+            if (column.Length <= 255)
             {
-                if (lowerName.Contains(keyword) || lowerOriginalName.Contains(keyword))
-                {
-                    return true;
-                }
+                return $"VARCHAR({Math.Max(1, column.Length)})";
             }
 
-            return false;
+            return column.Length <= 65_535 ? "TEXT" : "LONGTEXT";
         }
     }
 }
