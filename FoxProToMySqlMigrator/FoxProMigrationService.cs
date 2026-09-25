@@ -410,7 +410,7 @@ namespace FoxProToMySqlMigrator
 
         private static TableAllowlistResult ApplyTableAllowlist(string[] dbfFiles, IReadOnlyCollection<string>? tableFilter)
         {
-            if (tableFilter == null || tableFilter.Count == 0)
+            if (tableFilter == null)
             {
                 return new TableAllowlistResult
                 {
@@ -457,7 +457,7 @@ namespace FoxProToMySqlMigrator
             TableAllowlistResult allowlistResult,
             IReadOnlyCollection<string>? tableFilter)
         {
-            if (tableFilter == null || tableFilter.Count == 0)
+            if (tableFilter == null)
             {
                 return;
             }
@@ -680,7 +680,11 @@ namespace FoxProToMySqlMigrator
                 var wasResumingThisTable = string.Equals(checkpoint.CurrentTable, tableName, StringComparison.OrdinalIgnoreCase)
                     && checkpoint.CurrentTableLastCommittedRecordNumber > 0;
 
-                if (!wasResumingThisTable && await tableService.TableExistsAsync(mySqlConn, tableName, cancellationToken))
+                // Full Reload intentionally processes an existing table; CreateTableAsync
+                // truncates it before inserting the newly selected source rows.
+                if (migrationMode != MigrationMode.FullReload &&
+                    !wasResumingThisTable &&
+                    await tableService.TableExistsAsync(mySqlConn, tableName, cancellationToken))
                 {
                     _logger!.Log($"[{currentTable}/{totalTables}] ⏭️  Skipping existing MySQL table: {tableName}");
                     LogTableStatus(tableName, "SKIPPED_EXISTING", dbfFile, "MySQL table already exists.");
@@ -1725,7 +1729,7 @@ namespace FoxProToMySqlMigrator
                     transaction = physicalCopyResult.Transaction;
                     batchNumber = physicalCopyResult.BatchNumber;
                 }
-                
+
                 if (batchRows.Count > 0)
                 {
                     try

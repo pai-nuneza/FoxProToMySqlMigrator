@@ -37,7 +37,7 @@ namespace FoxProToMySqlMigrator
         public string TargetDatabase { get; set; } = AppSettings.DefaultDatabaseName;
         public string FoxProFolder { get; set; } = AppSettings.DefaultFoxProFolder;
         public int BatchSize { get; set; } = 1000;
-        public bool TableFilterEnabled { get; set; } = true;
+        public bool TableFilterEnabled { get; set; } = false;
     }
 
     public static class UserAppConfigStore

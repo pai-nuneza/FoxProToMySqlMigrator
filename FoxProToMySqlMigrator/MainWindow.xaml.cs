@@ -137,12 +137,14 @@ namespace FoxProToMySqlMigrator
 
         private IReadOnlyCollection<string>? GetActiveTableFilter()
         {
-            if (ChkOnlySelectedTables.IsChecked != true || !_neededTablesFileLoaded)
+            if (ChkOnlySelectedTables.IsChecked != true)
             {
                 return null;
             }
 
-            return _neededTables;
+            // When filtering is enabled, a missing file is an empty allowlist.
+            // Validation stops the operation instead of migrating every DBF.
+            return _neededTablesFileLoaded ? _neededTables : Array.Empty<string>();
         }
 
         private void UpdateSelectedTableCount()
@@ -152,13 +154,17 @@ namespace FoxProToMySqlMigrator
                 return;
             }
 
-            var count = _neededTables.Count;
-            if (!_neededTablesFileLoaded)
+            if (ChkOnlySelectedTables.IsChecked != true)
             {
-                TxtSelectedTableCount.Text = "Allowlist file missing; all DBF tables will be migrated";
+                TxtSelectedTableCount.Text = "Allowlist OFF - all DBF tables will be migrated";
+            }
+            else if (!_neededTablesFileLoaded)
+            {
+                TxtSelectedTableCount.Text = "Allowlist file missing; migration is disabled";
             }
             else
             {
+                var count = _neededTables.Count;
                 TxtSelectedTableCount.Text = count == 1
                     ? "1 table selected"
                     : $"{count:N0} tables selected";
@@ -179,7 +185,7 @@ namespace FoxProToMySqlMigrator
 
                     if (showSuccessMessage)
                     {
-                        MessageBox.Show("needed-tables.json was not found. The allowlist is disabled, so all DBF tables will be migrated.", "Reload JSON", MessageBoxButton.OK, MessageBoxImage.Information);
+                        MessageBox.Show("needed-tables.json was not found. If the allowlist is enabled, migration will be blocked until the file is available.", "Reload JSON", MessageBoxButton.OK, MessageBoxImage.Warning);
                     }
 
                     return;
@@ -473,17 +479,25 @@ namespace FoxProToMySqlMigrator
                 // Parse batch size
                 int.TryParse(TxtBatchSize.Text, out int batchSize);
 
-                await _migrationService.MigrateAsync(
-                    TxtFoxProFolder.Text,
+                var foxProFolder = TxtFoxProFolder.Text;
+                var databaseName = TxtDatabaseName.Text;
+                var tableFilter = GetActiveTableFilter();
+                var cancellationToken = _cancellationTokenSource.Token;
+
+                // DBF scanning is CPU-bound and can run for a long time on large
+                // files. Keep it off the WPF dispatcher so the window and Stop
+                // button remain responsive throughout the scan.
+                await Task.Run(() => _migrationService.MigrateAsync(
+                    foxProFolder,
                     connectionString,
-                    TxtDatabaseName.Text,
+                    databaseName,
                     true,
                     migrationMode,
                     batchSize,
-                    GetActiveTableFilter(),
+                    tableFilter,
                     resumeFromCheckpoint,
-                    _cancellationTokenSource.Token
-                );
+                    cancellationToken
+                ), cancellationToken);
 
                 if (!_cancellationTokenSource.Token.IsCancellationRequested)
                 {

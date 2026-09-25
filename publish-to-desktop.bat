@@ -61,8 +61,13 @@ if errorlevel 1 (
 )
 
 if not exist "%OUTPUT_DIR%\Data" mkdir "%OUTPUT_DIR%\Data"
-if not exist "%OUTPUT_DIR%\Data\needed-tables.json" (
-    copy "%SCRIPT_DIR%FoxProToMySqlMigrator\needed-tables.json" "%OUTPUT_DIR%\Data\needed-tables.json" >nul
+copy /Y "%SCRIPT_DIR%FoxProToMySqlMigrator\needed-tables.json" "%OUTPUT_DIR%\Data\needed-tables.json" >nul
+
+if errorlevel 1 (
+    echo.
+    echo Failed to copy needed-tables.json.
+    pause
+    exit /b 1
 )
 
 (

@@ -596,13 +596,19 @@
                                 <TextBlock Text="Migration table filter"
                                            Style="{StaticResource SectionTitleStyle}"/>
                                 <CheckBox x:Name="ChkOnlySelectedTables"
-                                          Content="Only migrate the tables in the saved needed-tables.json"
-                                          IsChecked="True"
+                                          Content="Use this filter"
+                                          IsChecked="False"
+                                          FontSize="13"
+                                          FontWeight="Bold"
+                                          Foreground="#FF5C5C"
+                                          ToolTip="When checked, only DBF tables listed in needed-tables.json are migrated."
                                           Checked="TableFilterSettings_Changed"
                                           Unchecked="TableFilterSettings_Changed"/>
                                 <TextBlock x:Name="TxtSelectedTableCount"
-                                           Text="0 tables selected"
-                                           Style="{StaticResource TipTextStyle}"/>
+                                           Text="Allowlist OFF - all DBF tables will be migrated"
+                                           Foreground="#FF7A7A"
+                                           FontSize="11"
+                                           Margin="22,4,0,0"/>
                             </StackPanel>
 
                             <StackPanel Grid.Column="1"

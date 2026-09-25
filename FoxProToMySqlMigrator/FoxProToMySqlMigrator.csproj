@@ -13,4 +13,12 @@
     <PackageReference Include="MySql.Data" Version="9.2.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="needed-tables.json">
+      <TargetPath>Data\needed-tables.json</TargetPath>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
